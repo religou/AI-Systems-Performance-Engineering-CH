@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 2,
+  "description": "普通翻译与长文本分片的词数分界线。高于此阈值采用长文本翻译（分片），低于则普通翻译。优先匹配 models 条目；未命中时使用 fallback。",
+  "fallback": {
+    "chunkThreshold": 5000
+  },
+  "models": {
+    "gpt-5.5*": {
+      "chunkThreshold": 6000
+    },
+    "deepseek-v4-flash": {
+      "chunkThreshold": 5000
+    }
+  }
+}

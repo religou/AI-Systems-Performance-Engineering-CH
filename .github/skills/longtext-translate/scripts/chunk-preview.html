@@ -1,0 +1,1596 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>分片边界确认</title>
+  <style>
+    :root {
+      --bg: #fafaf7;
+      --paper: #fffefa;
+      --paper-soft: #f4f3ee;
+      --paper-warm: #ede9df;
+      --ink: #1a1a1a;
+      --ink-soft: #2e2e2e;
+      --muted: #60605c;
+      --faint: #92928d;
+      --line: #1a1a1a;
+      --line-soft: rgba(26, 26, 26, .12);
+      --line-faint: rgba(26, 26, 26, .06);
+      --accent: #2e4ff2;
+      --accent-soft: #eef1ff;
+      --green: #0b7a42;
+      --green-soft: #eaf6ee;
+      --amber: #8c5800;
+      --amber-soft: #fdf3df;
+      --danger: #be251c;
+      --danger-soft: #fdf2f1;
+      --shadow: 0 16px 40px rgba(26, 26, 26, .05);
+      --shadow-soft: 0 8px 24px rgba(26, 26, 26, .03);
+      --mono: "JetBrains Mono", "SF Mono", ui-monospace, Menlo, Consolas, monospace;
+      --sans: "Noto Sans SC", -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+      --serif: "Noto Serif SC", "Songti SC", STSong, serif;
+    }
+
+    /* 深色模式自适应适配 */
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #121211;
+        --paper: #1a1a19;
+        --paper-soft: #232321;
+        --paper-warm: #2c2a26;
+        --ink: #e5e5e0;
+        --ink-soft: #cdcdc5;
+        --muted: #9c9c94;
+        --faint: #707069;
+        --line: #e5e5e0;
+        --line-soft: rgba(229, 229, 224, .16);
+        --line-faint: rgba(229, 229, 224, .08);
+        --accent: #5e76ff;
+        --accent-soft: #1b224c;
+        --green: #26a269;
+        --green-soft: #123321;
+        --amber: #d58700;
+        --amber-soft: #382400;
+        --danger: #e74c3c;
+        --danger-soft: #4c110d;
+        --shadow: 0 16px 40px rgba(0, 0, 0, .4);
+        --shadow-soft: 0 8px 24px rgba(0, 0, 0, .3);
+      }
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      height: 100vh;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+      background:
+        linear-gradient(90deg, rgba(140, 140, 130, .025) 1px, transparent 1px) 0 0 / 36px 36px,
+        linear-gradient(180deg, rgba(140, 140, 130, .018) 1px, transparent 1px) 0 0 / 36px 36px,
+        var(--bg);
+      color: var(--ink);
+      font-family: var(--sans);
+      -webkit-font-smoothing: antialiased;
+      text-rendering: optimizeLegibility;
+      transition: background-color .3s, color .3s;
+    }
+
+    button { font: inherit; cursor: pointer; border: none; background: none; }
+    button:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+
+    .header {
+      flex: 0 0 auto;
+      min-height: 72px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 20px;
+      padding: 14px 34px;
+      background: rgba(250, 250, 247, .85);
+      border-bottom: 1px solid var(--line-soft);
+      backdrop-filter: blur(20px);
+      z-index: 20;
+    }
+    @media (prefers-color-scheme: dark) {
+      .header { background: rgba(18, 18, 17, .85); }
+    }
+
+    .title-row {
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      min-width: 0;
+      flex-wrap: wrap;
+    }
+
+    h1 {
+      margin: 0;
+      font-family: var(--serif);
+      font-size: clamp(20px, 2.0vw, 30px);
+      font-weight: 700;
+      line-height: 1.1;
+      letter-spacing: -.02em;
+      white-space: nowrap;
+    }
+
+    .divider { width: 1px; height: 28px; background: var(--line); opacity: .2; }
+
+    .meta {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      min-width: 0;
+      color: var(--muted);
+      font-size: 12px;
+      flex-wrap: wrap;
+    }
+
+    .meta strong { color: var(--ink); font-weight: 700; }
+    .meta span { white-space: nowrap; }
+
+    .status-pill {
+      display: inline-flex;
+      align-items: center;
+      min-height: 24px;
+      border: 1px solid var(--line-soft);
+      border-radius: 999px;
+      background: var(--paper-soft);
+      color: var(--muted);
+      padding: 2px 10px;
+      font-size: 11px;
+      font-weight: 700;
+      transition: all .2s;
+    }
+
+    .status-pill.changed {
+      border-color: var(--accent);
+      background: var(--accent);
+      color: #ffffff;
+    }
+
+    .status-pill.limit {
+      border-color: rgba(140, 90, 0, .2);
+      background: var(--amber-soft);
+      color: var(--amber);
+    }
+
+    .header-actions {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex: 0 0 auto;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+    }
+
+    .button {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      min-height: 36px;
+      border: 1px solid var(--line-soft);
+      border-radius: 999px;
+      background: var(--paper);
+      color: var(--ink);
+      padding: 6px 16px;
+      font-size: 12px;
+      font-weight: 700;
+      box-shadow: var(--shadow-soft);
+      transition: all .2s ease;
+    }
+
+    .button.primary { background: var(--ink); border-color: var(--ink); color: var(--paper); }
+    .button.primary:hover:not(:disabled) { background: var(--accent); border-color: var(--accent); color: #fff; transform: translateY(-1px); }
+    .button:hover:not(:disabled) { background: var(--paper-soft); border-color: var(--line); transform: translateY(-1px); }
+    .button:disabled { opacity: .35; cursor: not-allowed; transform: none !important; }
+
+    .main {
+      flex: 1 1 auto;
+      overflow: auto;
+      padding: 24px 34px 80px;
+    }
+
+    .notice {
+      max-width: 1340px;
+      margin: 0 auto 16px;
+      border: 1px solid var(--line-soft);
+      border-left: 4px solid var(--accent);
+      border-radius: 12px;
+      background: var(--paper);
+      color: var(--muted);
+      padding: 12px 18px;
+      font-size: 13px;
+      line-height: 1.6;
+      box-shadow: var(--shadow-soft);
+    }
+
+    .notice strong { color: var(--ink); font-weight: 700; }
+    .notice.warn {
+      border-color: rgba(140, 90, 0, .2);
+      border-left-color: var(--amber);
+      background: var(--amber-soft);
+      color: var(--amber);
+    }
+
+    .workspace {
+      max-width: 1340px;
+      margin: 0 auto;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 260px;
+      gap: 20px;
+      align-items: start;
+    }
+
+    .editor {
+      background: var(--paper);
+      border: 1px solid var(--line-soft);
+      border-radius: 16px;
+      box-shadow: var(--shadow);
+      overflow: hidden;
+      transition: border-color .3s;
+    }
+
+    .navigator {
+      position: sticky;
+      top: 0;
+      max-height: calc(100vh - 120px);
+      overflow-y: auto;
+      border: 1px solid var(--line-soft);
+      border-radius: 16px;
+      background: rgba(255, 254, 250, .9);
+      box-shadow: var(--shadow-soft);
+      backdrop-filter: blur(16px);
+      transition: border-color .3s;
+      display: flex;
+      flex-direction: column;
+    }
+    @media (prefers-color-scheme: dark) {
+      .navigator { background: rgba(26, 26, 25, .9); }
+    }
+
+    .nav-title {
+      position: sticky;
+      top: 0;
+      z-index: 2;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      padding: 14px 16px;
+      border-bottom: 1px solid var(--line-soft);
+      background: var(--paper);
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 800;
+      letter-spacing: .08em;
+      text-transform: uppercase;
+    }
+
+    .nav-title span:first-child { font-family: var(--mono); }
+    .nav-title span:last-child { color: var(--ink); letter-spacing: 0; text-transform: none; }
+
+    .nav-utility {
+      padding: 12px 14px;
+      border-bottom: 1px solid var(--line-soft);
+      display: flex;
+      flex-direction: row;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 0px;
+      background: transparent;
+    }
+
+    .nav-utility .btn-action {
+      flex: 1 1 0;
+      min-width: 0;
+      min-height: 32px;
+      font-size: 11px;
+      padding: 4px 6px;
+      border-radius: 8px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      background: transparent; /* 与下方 chunk 列表未激活状态背景保持一致（透明） */
+      border: 1px solid transparent; /* 去除默认的粗边框 */
+      color: var(--muted);
+      box-shadow: none;
+      white-space: nowrap;
+      transition: all .2s cubic-bezier(0.16, 1, 0.3, 1);
+    }
+
+    .nav-utility .btn-action:hover {
+      background: var(--paper); /* 悬浮时填充为卡片背景白 */
+      color: var(--ink);
+      box-shadow: var(--shadow-soft); /* 悬浮时托起投影 */
+      transform: translateY(-1px);
+    }
+
+    /* 两个全局按钮之间的分割线 */
+    .nav-btn-divider {
+      width: 1px;
+      height: 16px;
+      background: var(--line-soft);
+      margin: 0 4px;
+      flex-shrink: 0;
+    }
+
+    /* 定位超限按钮：当下排出现问题块时，自适应柔和展开 */
+    #findOversizedBtn {
+      flex: 1 1 100%;
+      margin-top: 10px;
+      border-radius: 8px;
+      min-height: 32px;
+      font-size: 11px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      background: var(--amber-soft);
+      color: var(--amber);
+      border: 1px solid rgba(140, 90, 0, .15);
+      font-weight: 700;
+      transition: all .2s;
+    }
+    #findOversizedBtn:hover {
+      background: var(--amber);
+      color: #ffffff;
+      border-color: var(--amber);
+      box-shadow: var(--shadow-soft);
+      transform: translateY(-1px);
+    }
+
+    .nav-list { padding: 8px; display: flex; flex-direction: column; gap: 4px; overflow-y: auto; flex: 1; }
+
+    .nav-item {
+      width: 100%;
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 4px 8px;
+      align-items: center;
+      border: 1px solid transparent;
+      border-radius: 8px;
+      background: transparent;
+      color: var(--muted);
+      padding: 8px 12px;
+      text-align: left;
+      font-size: 11px;
+      transition: all .16s ease;
+    }
+
+    .nav-item:hover {
+      border-color: var(--line-soft);
+      background: var(--paper-soft);
+      color: var(--ink);
+    }
+
+    .nav-item.active {
+      border-color: var(--line-soft);
+      background: var(--accent-soft);
+      color: var(--ink);
+    }
+
+    .nav-item-title { color: var(--ink); font-family: var(--mono); font-weight: 800; }
+    .nav-item-meta { grid-column: 1 / -1; font-size: 11px; color: var(--faint); }
+
+    .nav-dot {
+      width: 16px;
+      height: 8px;
+      border-radius: 999px;
+      background: var(--green);
+    }
+    .nav-dot.warn { background: var(--amber); }
+
+    .chunk { position: relative; border-bottom: 1px solid var(--line-soft); scroll-margin-top: 18px; }
+    .chunk:last-child { border-bottom: 0; }
+    .chunk::before {
+      content: "";
+      position: absolute;
+      inset: 0 auto 0 0;
+      width: 4px;
+      background: var(--faint);
+      z-index: 3;
+      transition: background-color .2s;
+    }
+    .chunk:hover::before {
+      background: var(--ink);
+    }
+
+    .chunk-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 16px;
+      min-height: 48px;
+      padding: 12px 20px 12px 48px;
+      background: var(--paper-soft);
+      border-bottom: 1px solid var(--line-soft);
+      color: var(--muted);
+      font-size: 11px;
+      font-family: var(--mono);
+    }
+
+    .chunk-label { display: flex; align-items: center; gap: 8px; min-width: 0; white-space: nowrap; }
+    .chunk-label strong { color: var(--ink); font-weight: 900; letter-spacing: -.02em; }
+
+    .chunk-stats {
+      flex: 0 0 auto;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      white-space: nowrap;
+    }
+
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      border: 1px solid rgba(11, 122, 66, .15);
+      border-radius: 999px;
+      padding: 2px 8px;
+      font-family: var(--sans);
+      font-size: 11px;
+      font-weight: 800;
+      background: var(--green-soft);
+      color: var(--green);
+    }
+
+    .badge.warn { border-color: rgba(140, 90, 0, .2); background: var(--amber-soft); color: var(--amber); }
+
+    .para-row {
+      position: relative;
+      display: flex;
+      min-height: 42px;
+      border-bottom: 1px solid var(--line-faint);
+      border-top: 1px solid transparent;
+      margin-top: -1px;
+      transition: background .16s ease, border-color .16s ease;
+    }
+
+    .para-row:last-child { border-bottom-color: transparent; }
+    .para-row:hover,
+    .para-row:focus-within { background: var(--paper-soft); border-color: var(--line-soft); }
+    .para-row:hover .gutter,
+    .para-row:focus-within .gutter { color: var(--ink); }
+
+    .gutter {
+      flex: 0 0 48px;
+      width: 48px;
+      padding: 10px 8px 10px 0;
+      border-right: 1px solid var(--line-soft);
+      background: var(--paper-soft);
+      color: var(--faint);
+      text-align: right;
+      user-select: none;
+      font-family: var(--mono);
+      font-size: 11px;
+      line-height: 24px;
+      font-variant-numeric: tabular-nums;
+      opacity: .8;
+    }
+
+    .content {
+      flex: 1 1 auto;
+      min-width: 0;
+      padding: 10px 156px 10px 16px;
+      color: var(--ink-soft);
+      font-size: 15px;
+      line-height: 1.75;
+      word-break: break-word;
+      white-space: pre-wrap;
+    }
+
+    /* 精美排版与 Markdown 渲染 */
+    .content code {
+      font-family: var(--mono);
+      font-size: 0.9em;
+      background-color: var(--paper-soft);
+      padding: 2px 6px;
+      border-radius: 4px;
+      border: 1px solid var(--line-soft);
+    }
+
+    .content em {
+      font-style: italic;
+      color: var(--ink);
+    }
+
+    .content strong {
+      font-weight: 700;
+      color: var(--ink);
+    }
+
+    .kind-heading .content {
+      font-family: var(--serif);
+      font-size: 20px;
+      font-weight: 700;
+      line-height: 1.35;
+      letter-spacing: -.01em;
+      color: var(--ink);
+      background: linear-gradient(90deg, var(--paper-soft), rgba(255, 254, 250, 0) 90%);
+    }
+
+    .kind-heading.level-1 .content { font-size: 26px; }
+    .kind-heading.level-2 .content { font-size: 21px; }
+    .kind-code .content,
+    .kind-html .content {
+      margin: 10px 156px 10px 16px;
+      padding: 14px 16px;
+      border: 1px solid var(--line-soft);
+      border-radius: 8px;
+      background: var(--paper-soft);
+      color: var(--ink);
+      font-family: var(--mono);
+      font-size: 12px;
+      line-height: 1.75;
+      overflow-x: auto;
+      white-space: pre;
+    }
+
+    .kind-thematicBreak .content {
+      color: var(--faint);
+      letter-spacing: .25em;
+      text-align: center;
+      padding: 15px 0;
+    }
+
+    .actions {
+      position: absolute;
+      top: 50%;
+      right: 12px;
+      transform: translateY(-50%) scale(0.95);
+      display: flex;
+      gap: 4px;
+      opacity: 0;
+      padding: 4px;
+      border: 1px solid var(--line-soft);
+      border-radius: 999px;
+      background: var(--paper);
+      box-shadow: var(--shadow);
+      transition: all .16s ease;
+      z-index: 10;
+      pointer-events: none;
+    }
+
+    .para-row:hover .actions,
+    .para-row:focus-within .actions { opacity: 1; transform: translateY(-50%) scale(1); pointer-events: auto; }
+
+    .small-action {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      border: 0;
+      border-radius: 999px;
+      background: transparent;
+      color: var(--muted);
+      padding: 5px 10px;
+      font-size: 11px;
+      font-weight: 700;
+      white-space: nowrap;
+      transition: all .16s;
+    }
+
+    .small-action:hover { background: var(--paper-soft); color: var(--ink); }
+    .small-action.primary { color: var(--accent); }
+    .small-action.primary:hover { background: var(--accent); color: #ffffff; }
+
+    .fold-row {
+      display: flex;
+      min-height: 36px;
+      background: var(--paper-soft);
+      color: var(--muted);
+      font-family: var(--mono);
+      font-size: 11px;
+      cursor: pointer;
+      border-top: 1px dashed var(--line-soft);
+      border-bottom: 1px dashed var(--line-soft);
+      margin-top: -1px;
+      transition: all .2s;
+    }
+
+    .fold-row:hover { background: var(--paper-warm); color: var(--ink); }
+
+    .fold-gutter {
+      flex: 0 0 48px;
+      width: 48px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      border-right: 1px solid var(--line-soft);
+      background: var(--paper-soft);
+    }
+
+    .fold-content {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 7px 16px;
+      font-weight: 600;
+      flex-wrap: wrap;
+    }
+
+    .fold-meta {
+      color: var(--faint);
+      font-family: var(--sans);
+      font-weight: 500;
+      letter-spacing: 0;
+    }
+
+    .fold-row.expanded {
+      background: linear-gradient(90deg, var(--accent-soft), transparent 72%), var(--paper-soft);
+      color: var(--ink);
+    }
+
+    .fold-row.expanded .fold-gutter {
+      background: var(--accent-soft);
+      color: var(--accent);
+    }
+
+    .para-row.in-expanded-region {
+      background: linear-gradient(90deg, var(--accent-soft), transparent 84%);
+    }
+
+    .para-row.in-expanded-region .gutter {
+      color: var(--accent);
+    }
+
+    .merge-divider {
+      height: 40px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      margin-top: -1px;
+      border-top: 1px solid var(--line-soft);
+      border-bottom: 1px dashed var(--line-soft);
+      background: repeating-linear-gradient(90deg, var(--line-faint) 0 1px, transparent 1px 12px), var(--paper-soft);
+      cursor: pointer;
+      transition: all .2s;
+    }
+
+    .merge-divider:hover { background: var(--paper-warm); }
+
+    .merge-button {
+      opacity: .4;
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      border: 1px solid var(--line-soft);
+      border-radius: 999px;
+      background: var(--paper);
+      color: var(--muted);
+      padding: 4px 12px;
+      font-size: 11px;
+      font-weight: 800;
+      transform: translateY(1px);
+      transition: all .2s ease;
+    }
+
+    .merge-divider:hover .merge-button,
+    .merge-divider:focus-within .merge-button {
+      opacity: 1;
+      transform: translateY(0);
+      color: var(--ink);
+      border-color: var(--line);
+    }
+
+    .toast {
+      position: fixed;
+      left: 50%;
+      bottom: 28px;
+      transform: translate(-50%, 16px);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 12px 20px;
+      border: 1px solid var(--line-soft);
+      border-radius: 999px;
+      background: var(--ink);
+      color: var(--paper);
+      box-shadow: 0 16px 36px rgba(0,0,0,.3);
+      font-size: 13px;
+      opacity: 0;
+      pointer-events: none;
+      transition: all .2s cubic-bezier(0.16, 1, 0.3, 1);
+      z-index: 100;
+    }
+
+    .toast.show { opacity: 1; transform: translate(-50%, 0); }
+    .toast-icon { color: #2ecc71; font-weight: bold; }
+    .toast-icon.error { color: #e74c3c; }
+
+    @media (max-width: 980px) {
+      .workspace { grid-template-columns: 1fr; }
+      .navigator { position: static; max-height: none; }
+      .nav-list { display: flex; flex-direction: row; overflow-x: auto; gap: 6px; padding-bottom: 12px; }
+      .nav-item { min-width: 160px; }
+      .nav-utility { flex-direction: row; }
+    }
+
+    @media (max-width: 760px) {
+      body { overflow: auto; height: auto; min-height: 100vh; }
+      .header { align-items: flex-start; flex-direction: column; padding: 14px 16px; gap: 10px; }
+      .title-row { gap: 8px; }
+      .divider { display: none; }
+      .meta { align-items: flex-start; gap: 6px 9px; }
+      .header-actions { width: 100%; justify-content: flex-start; }
+      .button { min-height: 34px; padding: 5px 12px; }
+      .main { overflow: visible; padding: 16px 12px 56px; }
+      .notice { margin-bottom: 10px; }
+      .content { display: block; padding-right: 16px; font-size: 14px; }
+      .kind-code .content,
+      .kind-html .content { margin-right: 16px; }
+      .actions { position: absolute; opacity: 0; transform: translateY(-50%); margin: 0; width: max-content; }
+      .para-row:hover .actions,
+      .para-row:focus-within .actions { opacity: 1; transform: translateY(-50%) translateX(-2px); }
+      .workspace { gap: 0; }
+      .navigator { display: none; }
+      .chunk-header { flex-direction: column; align-items: flex-start; gap: 5px; padding: 9px 12px 9px 48px; }
+      .chunk-stats { white-space: normal; flex-wrap: wrap; gap: 6px; }
+      .gutter { flex-basis: 44px; width: 44px; padding-right: 6px; }
+      .fold-gutter { flex-basis: 44px; width: 44px; }
+      .kind-heading.level-1 .content { font-size: 22px; }
+      .kind-heading.level-2 .content { font-size: 19px; }
+      .kind-heading .content { font-size: 17px; }
+    }
+  </style>
+</head>
+<body>
+  <header class="header">
+    <div class="title-row">
+      <h1>分片边界确认</h1>
+      <div class="divider"></div>
+      <div class="meta">
+        <span>源文件：<strong id="sourceName">--</strong></span>
+        <span>当前分片：<strong id="chunkCount">--</strong></span>
+        <span>建议上限：<strong id="maxWords">--</strong></span>
+        <span class="status-pill" id="statusPill">未加载</span>
+        <span class="status-pill limit" id="limitPill" hidden>0 个超限</span>
+      </div>
+    </div>
+    <div class="header-actions">
+      <button class="button" id="undoButton" disabled>撤销</button>
+      <button class="button" id="resetButton" disabled>重置</button>
+      <button class="button primary" id="confirmButton" disabled>确认分片方案</button>
+    </div>
+  </header>
+
+  <main class="main" id="main">
+    <div class="notice" id="notice">正在加载分片预览。</div>
+    <div class="workspace">
+      <section class="editor" id="editor" aria-label="分片边界确认"></section>
+      <aside class="navigator" id="navigator" aria-label="分片导航" hidden>
+        <div class="nav-title"><span>Chunks</span><span id="overview">--</span></div>
+        <div class="nav-utility" id="navUtility">
+          <button class="btn-action" id="expandAllBtn">全部展开</button>
+          <div class="nav-btn-divider"></div>
+          <button class="btn-action" id="collapseAllBtn">恢复折叠</button>
+          <button class="button" id="findOversizedBtn" style="display: none;">定位超限分片</button>
+        </div>
+        <div class="nav-list" id="navList"></div>
+      </aside>
+    </div>
+  </main>
+
+  <div class="toast" id="toast"><span class="toast-icon" id="toastIcon">●</span><span id="toastText">操作成功</span></div>
+
+  <script type="application/json" id="previewData">__CHUNK_PREVIEW_DATA__</script>
+  <script>
+    const collapseThreshold = 10;
+    const maxHistory = 50;
+    const expandedHiddenSegmentIds = new Set();
+
+    let segments = [];
+    let chunks = [];
+    let originalChunks = [];
+    let history = [];
+    let sourceNameValue = "";
+    let sourceSha256 = "";
+    let splitter = "";
+    let maxWordsValue = 0;
+    let confirmEndpoint = "/chunk-plan";
+    let planFileName = "chunk-plan.json";
+    let pendingScrollFrame = false;
+    let confirmationState = "ready";
+
+    const main = document.getElementById("main");
+    const editor = document.getElementById("editor");
+    const notice = document.getElementById("notice");
+    const navigatorPanel = document.getElementById("navigator");
+    const navList = document.getElementById("navList");
+    const overview = document.getElementById("overview");
+    const confirmButton = document.getElementById("confirmButton");
+    const undoButton = document.getElementById("undoButton");
+    const resetButton = document.getElementById("resetButton");
+    const expandAllBtn = document.getElementById("expandAllBtn");
+    const collapseAllBtn = document.getElementById("collapseAllBtn");
+    const findOversizedBtn = document.getElementById("findOversizedBtn");
+    const chunkCount = document.getElementById("chunkCount");
+    const sourceName = document.getElementById("sourceName");
+    const maxWords = document.getElementById("maxWords");
+    const statusPill = document.getElementById("statusPill");
+    const limitPill = document.getElementById("limitPill");
+
+    confirmButton.addEventListener("click", confirmPlan);
+    undoButton.addEventListener("click", undoLastChange);
+    resetButton.addEventListener("click", resetPlan);
+    expandAllBtn.addEventListener("click", expandAllChunks);
+    collapseAllBtn.addEventListener("click", collapseAllChunks);
+
+    let scrollTimeout;
+    main.addEventListener("scroll", () => {
+      clearTimeout(scrollTimeout);
+      scrollTimeout = setTimeout(scheduleActiveNavUpdate, 60);
+    });
+
+    loadEmbeddedPreview();
+
+    setInterval(function () {
+      fetch("/heartbeat", { method: "GET", cache: "no-store" }).catch(function () {});
+    }, 60000);
+
+    function loadEmbeddedPreview() {
+      try {
+        const raw = document.getElementById("previewData").textContent.trim();
+        if (!raw || raw.startsWith("__")) {
+          throw new Error("此文件是预览模板，请通过 chunk.py preview 生成任务专用 HTML。");
+        }
+        const data = JSON.parse(raw);
+        if (data.version !== 1) throw new Error("不支持的预览版本：" + (data.version || "未知"));
+
+        segments = data.segments || [];
+        chunks = (data.chunks || []).map((segmentIds, index) => ({
+          id: chunkIdFromIndex(index),
+          segment_ids: [...segmentIds]
+        }));
+        originalChunks = cloneChunks(chunks);
+        history = [];
+        sourceNameValue = data.source_name || "";
+        sourceSha256 = data.source_sha256 || "";
+        splitter = data.splitter || "";
+        maxWordsValue = data.max_words || 0;
+        confirmEndpoint = data.confirm_endpoint || "/chunk-plan";
+        planFileName = data.plan_file || "chunk-plan.json";
+        confirmationState = "ready";
+        render();
+      } catch (err) {
+        editor.innerHTML = "";
+        navList.innerHTML = "";
+        navigatorPanel.hidden = true;
+        notice.hidden = false;
+        notice.className = "notice warn";
+        notice.textContent = "加载失败：" + err.message;
+        updateHeader(false);
+      }
+    }
+
+    function enhanceTypography(text) {
+      if (!text) return "";
+      let html = escapeHtml(text);
+      html = html.replace(/`([^`]+)`/g, "<code>$1</code>");
+      html = html.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+      html = html.replace(/\*([^*]+)\*/g, "<em>$1</em>");
+      html = html.replace(/(¹|²|³|⁴|⁵|⁶|⁷|⁸|⁹|⁰)/g, "<sup style='color:var(--accent); font-weight:bold;'>$1</sup>");
+      return html;
+    }
+
+    function render() {
+      editor.innerHTML = "";
+
+      if (segments.length === 0 || chunks.length === 0) {
+        notice.hidden = false;
+        notice.className = "notice warn";
+        notice.textContent = "没有可预览的分片。";
+        navigatorPanel.hidden = true;
+        updateHeader(false);
+        return;
+      }
+
+      const interactionLocked = isInteractionLocked();
+      navigatorPanel.hidden = false;
+      let globalIndex = 1;
+
+      chunks.forEach((chunk, chunkIndex) => {
+        const chunkElement = document.createElement("article");
+        chunkElement.className = "chunk";
+        chunkElement.dataset.chunkId = chunk.id;
+
+        const words = wordsOf(chunk);
+        const firstId = chunk.segment_ids[0];
+        const lastId = chunk.segment_ids[chunk.segment_ids.length - 1];
+        const badgeClass = maxWordsValue && words > maxWordsValue ? "badge warn" : "badge";
+        const badgeText = maxWordsValue && words > maxWordsValue ? "超过建议" : "正常";
+
+        chunkElement.appendChild(elementFromHtml(`
+          <div class="chunk-header">
+            <div class="chunk-label"><strong>${escapeHtml(chunk.id)}</strong></div>
+            <div class="chunk-stats">
+              <span>${escapeHtml(firstId)}–${escapeHtml(lastId)} · 约 ${words} 词</span>
+              <span class="${badgeClass}">${badgeText}</span>
+            </div>
+          </div>
+        `));
+
+        renderChunkBody(chunkElement, chunk, chunkIndex, globalIndex);
+        globalIndex += chunk.segment_ids.length;
+        editor.appendChild(chunkElement);
+
+        if (chunkIndex < chunks.length - 1) {
+          const divider = elementFromHtml(`
+            <div class="merge-divider" title="消除边界，合并上下两个分片" role="button" tabindex="0">
+              <div class="merge-button">合并相邻分片</div>
+            </div>
+          `);
+          if (interactionLocked) {
+            divider.setAttribute("aria-disabled", "true");
+            divider.removeAttribute("tabindex");
+          } else {
+            divider.addEventListener("click", () => mergeChunks(chunkIndex));
+            divider.addEventListener("keydown", (event) => {
+              if (event.key === "Enter" || event.key === " ") {
+                event.preventDefault();
+                mergeChunks(chunkIndex);
+              }
+            });
+          }
+          editor.appendChild(divider);
+        }
+      });
+
+      if (chunks.some((chunk) => maxWordsValue && wordsOf(chunk) > maxWordsValue)) {
+        findOversizedBtn.style.display = "inline-flex";
+        findOversizedBtn.onclick = interactionLocked ? null : scrollToFirstOversized;
+        findOversizedBtn.disabled = interactionLocked;
+      } else {
+        findOversizedBtn.style.display = "none";
+        findOversizedBtn.onclick = null;
+        findOversizedBtn.disabled = true;
+      }
+
+      updateNotice();
+      buildNavigator();
+      updateHeader(true);
+      updateActiveNav();
+    }
+
+    function renderChunkBody(chunkElement, chunk, chunkIndex, globalStartIndex) {
+      const items = chunkRenderItems(chunk);
+
+      items.forEach((item) => {
+        if (item.type === "segment") {
+          const row = renderParagraphRow(chunkIndex, item.segmentIndex, globalStartIndex + item.segmentIndex);
+          if (item.inExpandedRegion) {
+            row.classList.add("in-expanded-region");
+          }
+          chunkElement.appendChild(row);
+          return;
+        }
+        chunkElement.appendChild(renderFoldRow(item, chunkIndex, globalStartIndex));
+      });
+    }
+
+    function chunkRenderItems(chunk) {
+      const length = chunk.segment_ids.length;
+      if (length <= collapseThreshold) {
+        return chunk.segment_ids.map((_, index) => ({ type: "segment", segmentIndex: index, inExpandedRegion: false }));
+      }
+
+      const visibleIndexes = visibleSegmentIndexes(chunk);
+      const items = [];
+      let cursor = 0;
+
+      visibleIndexes.forEach((segmentIndex) => {
+        if (segmentIndex > cursor) {
+          items.push(buildHiddenRegion(chunk, cursor, segmentIndex - 1));
+        }
+        items.push({ type: "segment", segmentIndex, inExpandedRegion: false });
+        cursor = segmentIndex + 1;
+      });
+
+      if (cursor < length) {
+        items.push(buildHiddenRegion(chunk, cursor, length - 1));
+      }
+
+      return items;
+    }
+
+    function visibleSegmentIndexes(chunk) {
+      const visible = new Set([0, chunk.segment_ids.length - 1]);
+      chunk.segment_ids.forEach((segmentId, index) => {
+        const segment = getSegment(segmentId);
+        if (index > 0 && index < chunk.segment_ids.length - 1 && segment?.kind === "heading") {
+          visible.add(index);
+        }
+      });
+      return [...visible].sort((a, b) => a - b);
+    }
+
+    function buildHiddenRegion(chunk, startIndex, endIndex) {
+      const segmentIds = chunk.segment_ids.slice(startIndex, endIndex + 1);
+      const isExpanded = segmentIds.every((segmentId) => expandedHiddenSegmentIds.has(segmentId));
+      return {
+        type: "region",
+        chunkId: chunk.id,
+        startIndex,
+        endIndex,
+        hiddenCount: endIndex - startIndex + 1,
+        segmentIds,
+        words: wordsOfSegmentIds(segmentIds),
+        isExpanded
+      };
+    }
+
+    function renderFoldRow(region, chunkIndex, globalStartIndex) {
+      if (region.isExpanded) {
+        return renderExpandedRegion(region, chunkIndex, globalStartIndex);
+      }
+
+      const fold = elementFromHtml(`
+        <div class="fold-row" title="点击展开隐藏段落" role="button" tabindex="0">
+          <div class="fold-gutter">···</div>
+          <div class="fold-content">
+            <span>展开隐藏的 ${region.hiddenCount} 个中间段落</span>
+            <span class="fold-meta">约 ${region.words} 词</span>
+          </div>
+        </div>
+      `);
+      if (isInteractionLocked()) {
+        fold.setAttribute("aria-disabled", "true");
+        fold.removeAttribute("tabindex");
+        return fold;
+      }
+      const expand = () => {
+        renderPreservingScroll(() => {
+          expandRegion(region.segmentIds);
+        });
+      };
+      fold.addEventListener("click", expand);
+      fold.addEventListener("keydown", (event) => {
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          expand();
+        }
+      });
+      return fold;
+    }
+
+    function renderExpandedRegion(region, chunkIndex, globalStartIndex) {
+      const fragment = document.createDocumentFragment();
+      const fold = elementFromHtml(`
+        <div class="fold-row expanded" title="点击收起当前展开区域" role="button" tabindex="0">
+          <div class="fold-gutter">展开</div>
+          <div class="fold-content">
+            <span>已展开 ${region.hiddenCount} 个中间段落</span>
+            <span class="fold-meta">约 ${region.words} 词 · 点击收起此处</span>
+          </div>
+        </div>
+      `);
+
+      if (isInteractionLocked()) {
+        fold.setAttribute("aria-disabled", "true");
+        fold.removeAttribute("tabindex");
+      } else {
+        const collapse = () => {
+          renderPreservingScroll(() => {
+            collapseRegion(region.segmentIds);
+          });
+        };
+        fold.addEventListener("click", collapse);
+        fold.addEventListener("keydown", (event) => {
+          if (event.key === "Enter" || event.key === " ") {
+            event.preventDefault();
+            collapse();
+          }
+        });
+      }
+
+      fragment.appendChild(fold);
+      for (let index = region.startIndex; index <= region.endIndex; index += 1) {
+        const row = renderParagraphRow(chunkIndex, index, globalStartIndex + index);
+        row.classList.add("in-expanded-region");
+        fragment.appendChild(row);
+      }
+      return fragment;
+    }
+
+    function renderParagraphRow(chunkIndex, segmentIndex, globalIndex) {
+      const chunk = chunks[chunkIndex];
+      const segmentId = chunk.segment_ids[segmentIndex];
+      const segment = getSegment(segmentId);
+      const kind = segment?.kind || "flow";
+      const row = document.createElement("div");
+      row.className = `para-row kind-${kind} ${headingLevelClass(segment)}`.trim();
+      row.dataset.segmentId = segmentId;
+      row.dataset.chunkId = chunk.id;
+
+      const gutter = document.createElement("div");
+      gutter.className = "gutter";
+      gutter.textContent = globalIndex;
+      row.appendChild(gutter);
+
+      const content = document.createElement("div");
+      content.className = "content";
+      content.innerHTML = segment ? enhanceTypography(segment.text) : "";
+
+      const actions = document.createElement("div");
+      actions.className = "actions";
+
+      if (segmentIndex === 0 && chunkIndex > 0) {
+        actions.appendChild(createAction("并入上一片", "primary", () => moveToPreviousChunk(chunkIndex)));
+      }
+      if (segmentIndex === chunk.segment_ids.length - 1 && chunkIndex < chunks.length - 1) {
+        actions.appendChild(createAction("并入下一片", "primary", () => moveToNextChunk(chunkIndex)));
+      }
+      if (segmentIndex > 0) {
+        actions.appendChild(createAction("从此拆分", "", () => splitChunk(chunkIndex, segmentIndex)));
+      }
+
+      if (actions.children.length > 0) content.appendChild(actions);
+      row.appendChild(content);
+      return row;
+    }
+
+    function createAction(label, variant, onClick) {
+      const button = document.createElement("button");
+      button.className = `small-action ${variant}`;
+      button.type = "button";
+      button.textContent = label;
+      button.disabled = isInteractionLocked();
+      button.addEventListener("click", (event) => {
+        event.stopPropagation();
+        if (button.disabled) return;
+        onClick();
+      });
+      return button;
+    }
+
+    function isInteractionLocked() {
+      return confirmationState === "closing" || confirmationState === "confirmed";
+    }
+
+    function captureScrollAnchor() {
+      const mainRect = main.getBoundingClientRect();
+      const anchorLine = mainRect.top + Math.min(140, main.clientHeight / 3);
+      const candidates = [
+        ...editor.querySelectorAll(".para-row[data-segment-id]"),
+        ...editor.querySelectorAll(".chunk[data-chunk-id]")
+      ];
+      let best = null;
+
+      candidates.forEach((element) => {
+        const rect = element.getBoundingClientRect();
+        if (rect.bottom < mainRect.top || rect.top > mainRect.bottom) return;
+        const distance = rect.top <= anchorLine ? anchorLine - rect.top : rect.top - anchorLine;
+        const priority = element.dataset.segmentId ? 0 : 1;
+        if (
+          !best ||
+          priority < best.priority ||
+          (priority === best.priority && distance < best.distance)
+        ) {
+          best = {
+            segmentId: element.dataset.segmentId || "",
+            chunkId: element.dataset.chunkId || "",
+            topOffset: rect.top - mainRect.top,
+            distance,
+            priority
+          };
+        }
+      });
+
+      return best;
+    }
+
+    function restoreScrollAnchor(anchor) {
+      if (!anchor) return;
+      const target = findAnchorTarget(anchor);
+      if (!target) return;
+
+      const mainRect = main.getBoundingClientRect();
+      const targetTop = target.getBoundingClientRect().top - mainRect.top;
+      main.scrollTop += targetTop - anchor.topOffset;
+      updateActiveNav();
+    }
+
+    function findAnchorTarget(anchor) {
+      if (anchor.segmentId) {
+        const segmentTarget = [...editor.querySelectorAll(".para-row[data-segment-id]")]
+          .find((row) => row.dataset.segmentId === anchor.segmentId);
+        if (segmentTarget) return segmentTarget;
+      }
+      if (anchor.chunkId) {
+        const chunkTarget = [...editor.querySelectorAll(".chunk[data-chunk-id]")]
+          .find((chunk) => chunk.dataset.chunkId === anchor.chunkId);
+        if (chunkTarget) return chunkTarget;
+      }
+      return null;
+    }
+
+    function renderPreservingScroll(change) {
+      const anchor = captureScrollAnchor();
+      change();
+      render();
+      restoreScrollAnchor(anchor);
+    }
+
+    function expandedSegmentIds() {
+      return new Set(expandedHiddenSegmentIds);
+    }
+
+    function restoreExpandedChunks(segmentIds) {
+      expandedHiddenSegmentIds.clear();
+      chunks.forEach((chunk) => {
+        const regions = chunkHiddenRegions(chunk);
+        regions.forEach((region) => {
+          if (region.segmentIds.some((segmentId) => segmentIds.has(segmentId))) {
+            expandRegion(region.segmentIds);
+          }
+        });
+      });
+    }
+
+    function chunkHiddenRegions(chunk) {
+      if (chunk.segment_ids.length <= collapseThreshold) {
+        return [];
+      }
+      const visibleIndexes = visibleSegmentIndexes(chunk);
+      const regions = [];
+      let cursor = 0;
+      visibleIndexes.forEach((segmentIndex) => {
+        if (segmentIndex > cursor) {
+          regions.push(buildHiddenRegion(chunk, cursor, segmentIndex - 1));
+        }
+        cursor = segmentIndex + 1;
+      });
+      if (cursor < chunk.segment_ids.length) {
+        regions.push(buildHiddenRegion(chunk, cursor, chunk.segment_ids.length - 1));
+      }
+      return regions;
+    }
+
+    function expandRegion(segmentIds) {
+      segmentIds.forEach((segmentId) => expandedHiddenSegmentIds.add(segmentId));
+    }
+
+    function collapseRegion(segmentIds) {
+      segmentIds.forEach((segmentId) => expandedHiddenSegmentIds.delete(segmentId));
+    }
+
+    function moveToPreviousChunk(chunkIndex) {
+      const current = chunks[chunkIndex];
+      const previous = chunks[chunkIndex - 1];
+      if (!current || !previous || current.segment_ids.length === 0) return;
+      renderPreservingScroll(() => {
+        const expandedBefore = expandedSegmentIds();
+        saveHistory();
+        previous.segment_ids.push(current.segment_ids.shift());
+        removeEmptyChunk(chunkIndex);
+        renumberChunks();
+        restoreExpandedChunks(expandedBefore);
+      });
+      showToast("已并入上一片");
+    }
+
+    function moveToNextChunk(chunkIndex) {
+      const current = chunks[chunkIndex];
+      const next = chunks[chunkIndex + 1];
+      if (!current || !next || current.segment_ids.length === 0) return;
+      renderPreservingScroll(() => {
+        const expandedBefore = expandedSegmentIds();
+        saveHistory();
+        next.segment_ids.unshift(current.segment_ids.pop());
+        removeEmptyChunk(chunkIndex);
+        renumberChunks();
+        restoreExpandedChunks(expandedBefore);
+      });
+      showToast("已并入下一片");
+    }
+
+    function splitChunk(chunkIndex, segmentIndex) {
+      const chunk = chunks[chunkIndex];
+      if (!chunk || segmentIndex <= 0 || segmentIndex >= chunk.segment_ids.length) return;
+      renderPreservingScroll(() => {
+        const expandedBefore = expandedSegmentIds();
+        saveHistory();
+        const newSegmentIds = chunk.segment_ids.splice(segmentIndex);
+        chunks.splice(chunkIndex + 1, 0, { id: "", segment_ids: newSegmentIds });
+        renumberChunks();
+        restoreExpandedChunks(expandedBefore);
+      });
+      showToast("已拆分为新分片");
+    }
+
+    function mergeChunks(chunkIndex) {
+      const current = chunks[chunkIndex];
+      const next = chunks[chunkIndex + 1];
+      if (!current || !next) return;
+      renderPreservingScroll(() => {
+        const expandedBefore = expandedSegmentIds();
+        saveHistory();
+        current.segment_ids.push(...next.segment_ids);
+        chunks.splice(chunkIndex + 1, 1);
+        renumberChunks();
+        restoreExpandedChunks(expandedBefore);
+      });
+      showToast("相邻分片已合并");
+    }
+
+    function removeEmptyChunk(chunkIndex) {
+      if (chunks[chunkIndex]?.segment_ids.length === 0) {
+        collapseRegion(chunks[chunkIndex].segment_ids);
+        chunks.splice(chunkIndex, 1);
+      }
+    }
+
+    function undoLastChange() {
+      if (history.length === 0) return;
+      renderPreservingScroll(() => {
+        chunks = history.pop();
+        renumberChunks();
+      });
+      showToast("已撤销上一步");
+    }
+
+    function resetPlan() {
+      if (!isModified()) return;
+      renderPreservingScroll(() => {
+        saveHistory();
+        chunks = cloneChunks(originalChunks);
+        expandedHiddenSegmentIds.clear();
+      });
+      showToast("已恢复默认分片");
+    }
+
+    function saveHistory() {
+      const snapshot = cloneChunks(chunks);
+      const last = history[history.length - 1];
+      if (last && serializeChunks(last) === serializeChunks(snapshot)) return;
+      history.push(snapshot);
+      if (history.length > maxHistory) history.shift();
+    }
+
+    function renumberChunks() {
+      chunks.forEach((chunk, index) => { chunk.id = chunkIdFromIndex(index); });
+    }
+
+    function buildNavigator() {
+      navList.innerHTML = "";
+      const interactionLocked = isInteractionLocked();
+      const fragment = document.createDocumentFragment();
+      chunks.forEach((chunk) => {
+        const words = wordsOf(chunk);
+        const button = document.createElement("button");
+        button.className = "nav-item";
+        button.type = "button";
+        button.dataset.chunkId = chunk.id;
+        button.disabled = interactionLocked;
+        button.innerHTML = `
+          <span class="nav-item-title">${escapeHtml(chunk.id)}</span>
+          <span class="nav-dot${maxWordsValue && words > maxWordsValue ? " warn" : ""}"></span>
+          <span class="nav-item-meta">约 ${words} 词 · ${chunk.segment_ids.length} 段</span>
+        `;
+        button.addEventListener("click", () => {
+          if (button.disabled) return;
+          const target = editor.querySelector(`[data-chunk-id="${chunk.id}"]`);
+          if (!target) return;
+          target.scrollIntoView({ behavior: "smooth", block: "start" });
+          setActiveNav(chunk.id);
+          setTimeout(() => setActiveNav(chunk.id), 260);
+        });
+        fragment.appendChild(button);
+      });
+      navList.appendChild(fragment);
+    }
+
+    function scheduleActiveNavUpdate() {
+      if (pendingScrollFrame) return;
+      pendingScrollFrame = true;
+      requestAnimationFrame(() => {
+        pendingScrollFrame = false;
+        updateActiveNav();
+      });
+    }
+
+    function updateActiveNav() {
+      if (!chunks.length) return;
+      const mainRect = main.getBoundingClientRect();
+      const bottomGap = main.scrollHeight - main.scrollTop - main.clientHeight;
+      if (bottomGap <= 2) {
+        setActiveNav(chunks[chunks.length - 1].id);
+        return;
+      }
+
+      let activeId = chunks[0].id;
+      editor.querySelectorAll(".chunk").forEach((chunkElement) => {
+        const top = chunkElement.getBoundingClientRect().top - mainRect.top;
+        if (top <= 120) activeId = chunkElement.dataset.chunkId;
+      });
+      setActiveNav(activeId);
+    }
+
+    function setActiveNav(activeId) {
+      navList.querySelectorAll(".nav-item").forEach((button) => {
+        button.classList.toggle("active", button.dataset.chunkId === activeId);
+      });
+    }
+
+    function updateNotice() {
+      notice.hidden = true;
+      notice.className = "notice";
+      notice.textContent = "";
+    }
+
+    function updateHeader(hasData) {
+      const modified = hasData && isModified();
+      const confirmed = hasData && confirmationState === "confirmed";
+      const interactionLocked = confirmed || confirmationState === "closing";
+      const oversized = hasData ? chunks.filter((chunk) => maxWordsValue && wordsOf(chunk) > maxWordsValue).length : 0;
+      chunkCount.textContent = hasData ? chunks.length : "--";
+      sourceName.textContent = hasData && sourceNameValue ? sourceNameValue : "--";
+      maxWords.textContent = hasData && maxWordsValue ? maxWordsValue : "--";
+      overview.textContent = hasData ? `${chunks.length} 片${oversized ? ` · ${oversized} 超限` : ""}` : "--";
+      statusPill.textContent = !hasData ? "未加载" : confirmed ? "已确认" : modified ? "已调整 · 待确认" : "默认方案";
+      statusPill.className = modified && !confirmed ? "status-pill changed" : "status-pill";
+      statusPill.title = !hasData
+        ? "预览数据尚未加载。"
+        : confirmed
+          ? modified
+            ? `当前分片方案已保存到 ${planFileName}。本地预览即将关闭，回到对话回复继续即可。`
+            : "当前默认分片已确认，无需额外写入方案文件。本地预览即将关闭，回到对话回复继续即可。"
+          : modified
+            ? "已检测到边界调整。点击确认后，页面会把当前方案保存给后续脚本使用。"
+            : "当前仍是默认分片。若接受该方案，可直接确认继续；此时不会额外生成方案文件。";
+      limitPill.hidden = !oversized;
+      limitPill.textContent = `${oversized} 个超限`;
+      limitPill.title = oversized ? `有 ${oversized} 个分片超过建议上限，请确认这是有意保留。` : "";
+      confirmButton.disabled = !hasData || interactionLocked;
+      undoButton.disabled = !hasData || interactionLocked || history.length === 0;
+      resetButton.disabled = !hasData || interactionLocked || !modified;
+      expandAllBtn.disabled = !hasData || interactionLocked;
+      collapseAllBtn.disabled = !hasData || interactionLocked;
+      confirmButton.textContent = confirmationState === "closing"
+        ? "正在确认…"
+        : confirmed
+          ? "已确认"
+          : modified
+            ? "确认分片方案"
+            : "按默认方案继续";
+      confirmButton.title = confirmed
+        ? "当前预览已确认。"
+        : modified
+          ? "保存当前分片方案，供后续脚本生成 chunks。"
+          : "接受当前默认分片并继续，不会额外生成方案文件。";
+    }
+
+    function buildCompactPlan() {
+      return {
+        version: 1,
+        source_name: sourceNameValue,
+        source_sha256: sourceSha256,
+        splitter: splitter,
+        max_words: maxWordsValue,
+        chunks: chunks.map((chunk) => [...chunk.segment_ids])
+      };
+    }
+
+    async function confirmPlan() {
+      if (window.location.protocol !== "http:" && window.location.protocol !== "https:") {
+        showToast("请通过本地预览 URL 打开此页面后再确认", "error");
+        return;
+      }
+      if (isInteractionLocked()) {
+        return;
+      }
+      const modified = isModified();
+      const payload = { confirm_default: !modified };
+      if (modified) {
+        payload.plan = buildCompactPlan();
+      }
+      confirmationState = "closing";
+      render();
+      try {
+        const response = await fetch(confirmEndpoint, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload)
+        });
+        const result = await response.json();
+        if (!response.ok || !result.ok) {
+          throw new Error(result.error || "确认失败");
+        }
+        confirmationState = "confirmed";
+        render();
+        showToast(modified ? `分片方案已保存到 ${planFileName}，本地预览即将关闭` : "已接受默认分片方案，本地预览即将关闭");
+      } catch (err) {
+        confirmationState = "ready";
+        render();
+        showToast(err.message || "确认失败，请检查本地预览服务是否仍在运行", "error");
+      }
+    }
+
+    function expandAllChunks() {
+      renderPreservingScroll(() => {
+        chunks.forEach((chunk) => {
+          chunkHiddenRegions(chunk).forEach((region) => expandRegion(region.segmentIds));
+        });
+      });
+      showToast("所有隐藏段落已完全展开");
+    }
+
+    function collapseAllChunks() {
+      renderPreservingScroll(() => {
+        expandedHiddenSegmentIds.clear();
+      });
+      showToast("长分片已收起，仅显示首尾部");
+    }
+
+    function scrollToFirstOversized() {
+      const targetChunk = chunks.find((chunk) => maxWordsValue && wordsOf(chunk) > maxWordsValue);
+      if (!targetChunk) return;
+      const target = editor.querySelector(`[data-chunk-id="${targetChunk.id}"]`);
+      if (!target) return;
+      target.scrollIntoView({ behavior: "smooth", block: "start" });
+      setActiveNav(targetChunk.id);
+      showToast(`已定位至超限分片：${targetChunk.id}`);
+    }
+
+    let toastTimer;
+    function showToast(message, type = "success") {
+      const toast = document.getElementById("toast");
+      const toastText = document.getElementById("toastText");
+      const toastIcon = document.getElementById("toastIcon");
+      toastText.textContent = message;
+      toastIcon.className = type === "success" ? "toast-icon" : "toast-icon error";
+      toastIcon.textContent = type === "success" ? "●" : "!";
+      toast.classList.add("show");
+      clearTimeout(toastTimer);
+      toastTimer = setTimeout(() => toast.classList.remove("show"), type === "error" ? 3600 : 1900);
+    }
+
+    function wordsOf(chunk) {
+      return wordsOfSegmentIds(chunk.segment_ids);
+    }
+
+    function wordsOfSegmentIds(segmentIds) {
+      return segmentIds.reduce((sum, segmentId) => {
+        const segment = getSegment(segmentId);
+        return sum + (segment ? segment.words : 0);
+      }, 0);
+    }
+
+    function getSegment(id) {
+      return segments.find((segment) => segment.id === id);
+    }
+
+    function cloneChunks(source) {
+      return source.map((chunk) => ({ id: chunk.id, segment_ids: [...chunk.segment_ids] }));
+    }
+
+    function serializeChunks(source) {
+      return JSON.stringify(source.map((chunk) => chunk.segment_ids));
+    }
+
+    function isModified() {
+      return serializeChunks(chunks) !== serializeChunks(originalChunks);
+    }
+
+    function headingLevelClass(segment) {
+      const match = segment?.text?.match(/^(#{1,6})\s/);
+      return match ? `level-${match[1].length}` : "";
+    }
+
+    function chunkIdFromIndex(index) {
+      return `chunk-${String(index + 1).padStart(2, "0")}`;
+    }
+
+    function elementFromHtml(html) {
+      const template = document.createElement("template");
+      template.innerHTML = html.trim();
+      return template.content.firstElementChild;
+    }
+
+    function escapeHtml(text) {
+      return String(text).replace(/[&<>"]/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[char]));
+    }
+  </script>
+</body>
+</html>

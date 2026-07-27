@@ -1,0 +1,1462 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>排版变更确认</title>
+  <style>
+    :root {
+      --bg: #fafaf7;
+      --paper: #fffefa;
+      --paper-soft: #f4f3ee;
+      --paper-warm: #ede9df;
+      --ink: #1a1a1a;
+      --ink-soft: #2e2e2e;
+      --muted: #60605c;
+      --faint: #92928d;
+      --line: #1a1a1a;
+      --line-soft: rgba(26, 26, 26, .12);
+      --line-faint: rgba(26, 26, 26, .06);
+      --accent: #2e4ff2;
+      --accent-soft: #eef1ff;
+      --green: #0b7a42;
+      --green-soft: #eaf6ee;
+      --amber: #8c5800;
+      --amber-soft: #fdf3df;
+      --danger: #be251c;
+      --danger-soft: #fdf2f1;
+      --shadow: 0 16px 40px rgba(26, 26, 26, .05);
+      --shadow-soft: 0 8px 24px rgba(26, 26, 26, .03);
+      --mono: "JetBrains Mono", "SF Mono", ui-monospace, Menlo, Consolas, monospace;
+      --sans: "Noto Sans SC", -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+      --serif: "Noto Serif SC", "Songti SC", STSong, serif;
+    }
+
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #121211;
+        --paper: #1a1a19;
+        --paper-soft: #232321;
+        --paper-warm: #2c2a26;
+        --ink: #e5e5e0;
+        --ink-soft: #cdcdc5;
+        --muted: #9c9c94;
+        --faint: #707069;
+        --line: #e5e5e0;
+        --line-soft: rgba(229, 229, 224, .16);
+        --line-faint: rgba(229, 229, 224, .08);
+        --accent: #5e76ff;
+        --accent-soft: #1b224c;
+        --green: #26a269;
+        --green-soft: #123321;
+        --amber: #d58700;
+        --amber-soft: #382400;
+        --danger: #e74c3c;
+        --danger-soft: #4c110d;
+        --shadow: 0 16px 40px rgba(0, 0, 0, .4);
+        --shadow-soft: 0 8px 24px rgba(0, 0, 0, .3);
+      }
+    }
+
+    * { box-sizing: border-box; }
+
+    html, body {
+      margin: 0;
+      min-height: 100%;
+    }
+
+    body {
+      height: 100vh;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+      background:
+        linear-gradient(90deg, rgba(140, 140, 130, .025) 1px, transparent 1px) 0 0 / 36px 36px,
+        linear-gradient(180deg, rgba(140, 140, 130, .018) 1px, transparent 1px) 0 0 / 36px 36px,
+        var(--bg);
+      color: var(--ink);
+      font-family: var(--sans);
+      -webkit-font-smoothing: antialiased;
+      text-rendering: optimizeLegibility;
+      transition: background-color .3s, color .3s;
+    }
+
+    button,
+    input {
+      font: inherit;
+    }
+
+    button {
+      cursor: pointer;
+      border: none;
+      background: none;
+    }
+
+    button:focus-visible,
+    input:focus-visible {
+      outline: 2px solid var(--accent);
+      outline-offset: 3px;
+    }
+
+    .header {
+      flex: 0 0 auto;
+      min-height: 72px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 20px;
+      padding: 14px 34px;
+      background: rgba(250, 250, 247, .85);
+      border-bottom: 1px solid var(--line-soft);
+      backdrop-filter: blur(20px);
+      z-index: 20;
+    }
+
+    @media (prefers-color-scheme: dark) {
+      .header { background: rgba(18, 18, 17, .85); }
+    }
+
+    .title-row {
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      min-width: 0;
+      flex-wrap: wrap;
+    }
+
+    h1 {
+      margin: 0;
+      font-family: var(--serif);
+      font-size: clamp(20px, 2vw, 30px);
+      font-weight: 700;
+      line-height: 1.1;
+      letter-spacing: -.02em;
+      white-space: nowrap;
+    }
+
+    .divider {
+      width: 1px;
+      height: 28px;
+      background: var(--line);
+      opacity: .2;
+    }
+
+    .meta {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      min-width: 0;
+      color: var(--muted);
+      font-size: 12px;
+      flex-wrap: wrap;
+    }
+
+    .meta strong {
+      color: var(--ink);
+      font-weight: 700;
+    }
+
+    .meta span {
+      white-space: nowrap;
+    }
+
+    .meta-summary {
+      color: var(--muted);
+    }
+
+    .status-pill {
+      display: inline-flex;
+      align-items: center;
+      min-height: 24px;
+      border: 1px solid var(--line-soft);
+      border-radius: 999px;
+      background: var(--paper-soft);
+      color: var(--muted);
+      padding: 2px 10px;
+      font-size: 11px;
+      font-weight: 700;
+      transition: all .2s;
+    }
+
+    .status-pill.changed {
+      border-color: var(--accent);
+      background: var(--accent);
+      color: #ffffff;
+    }
+
+    .status-pill.clean,
+    .status-pill.applied {
+      border-color: rgba(11, 122, 66, .15);
+      background: var(--green-soft);
+      color: var(--green);
+    }
+
+    .status-pill.warn {
+      border-color: rgba(140, 90, 0, .2);
+      background: var(--amber-soft);
+      color: var(--amber);
+    }
+
+    .status-pill.error {
+      border-color: rgba(190, 37, 28, .2);
+      background: var(--danger-soft);
+      color: var(--danger);
+    }
+
+    .header-actions {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex: 0 0 auto;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+    }
+
+    .button {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      min-height: 36px;
+      border: 1px solid var(--line-soft);
+      border-radius: 999px;
+      background: var(--paper);
+      color: var(--ink);
+      padding: 6px 16px;
+      font-size: 12px;
+      font-weight: 700;
+      box-shadow: var(--shadow-soft);
+      transition: all .2s ease;
+    }
+
+    .button.primary {
+      background: var(--ink);
+      border-color: var(--ink);
+      color: var(--paper);
+    }
+
+    .button.primary:hover:not(:disabled) {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: #fff;
+      transform: translateY(-1px);
+    }
+
+    .button:hover:not(:disabled) {
+      background: var(--paper-soft);
+      border-color: var(--line);
+      transform: translateY(-1px);
+    }
+
+    .button.danger:hover:not(:disabled) {
+      background: var(--danger-soft);
+      border-color: var(--danger);
+      color: var(--danger);
+    }
+
+    .button:disabled {
+      opacity: .35;
+      cursor: not-allowed;
+      transform: none !important;
+    }
+
+    .main {
+      flex: 1 1 auto;
+      overflow: auto;
+      padding: 24px 34px 80px;
+    }
+
+    .notice {
+      max-width: 1340px;
+      margin: 0 auto 16px;
+      border: 1px solid var(--line-soft);
+      border-left: 4px solid var(--accent);
+      border-radius: 12px;
+      background: var(--paper);
+      color: var(--muted);
+      padding: 12px 18px;
+      font-size: 13px;
+      line-height: 1.6;
+      box-shadow: var(--shadow-soft);
+    }
+
+    .notice strong {
+      color: var(--ink);
+      font-weight: 700;
+    }
+
+    .notice.clean {
+      border-color: rgba(11, 122, 66, .15);
+      border-left-color: var(--green);
+      background: var(--green-soft);
+      color: var(--green);
+    }
+
+    .notice.warn {
+      border-color: rgba(140, 90, 0, .2);
+      border-left-color: var(--amber);
+      background: var(--amber-soft);
+      color: var(--amber);
+    }
+
+    .notice.error {
+      border-color: rgba(190, 37, 28, .2);
+      border-left-color: var(--danger);
+      background: var(--danger-soft);
+      color: var(--danger);
+    }
+
+    .workspace {
+      max-width: 1340px;
+      margin: 0 auto;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 280px;
+      gap: 20px;
+      align-items: start;
+    }
+
+    .editor {
+      background: var(--paper);
+      border: 1px solid var(--line-soft);
+      border-radius: 16px;
+      box-shadow: var(--shadow);
+      overflow: hidden;
+    }
+
+    .navigator {
+      position: sticky;
+      top: 0;
+      max-height: calc(100vh - 120px);
+      overflow-y: auto;
+      border: 1px solid var(--line-soft);
+      border-radius: 16px;
+      background: rgba(255, 254, 250, .9);
+      box-shadow: var(--shadow-soft);
+      backdrop-filter: blur(16px);
+      display: flex;
+      flex-direction: column;
+    }
+
+    @media (prefers-color-scheme: dark) {
+      .navigator { background: rgba(26, 26, 25, .9); }
+    }
+
+    .nav-title {
+      position: sticky;
+      top: 0;
+      z-index: 2;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      padding: 14px 16px;
+      border-bottom: 1px solid var(--line-soft);
+      background: var(--paper);
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 800;
+      letter-spacing: .08em;
+      text-transform: uppercase;
+    }
+
+    .nav-title span:first-child { font-family: var(--mono); }
+    .nav-title span:last-child {
+      color: var(--ink);
+      letter-spacing: 0;
+      text-transform: none;
+    }
+
+    .nav-utility {
+      padding: 12px 14px;
+      border-bottom: 1px solid var(--line-soft);
+      display: grid;
+      grid-template-columns: 1fr 1fr 1fr;
+      gap: 6px;
+      background: transparent;
+    }
+
+    .nav-utility .btn-action {
+      min-width: 0;
+      min-height: 32px;
+      font-size: 11px;
+      padding: 4px 6px;
+      border-radius: 8px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      background: transparent;
+      border: 1px solid transparent;
+      color: var(--muted);
+      box-shadow: none;
+      white-space: nowrap;
+      transition: all .2s cubic-bezier(0.16, 1, 0.3, 1);
+    }
+
+    .nav-utility .btn-action:hover:not(:disabled) {
+      background: var(--paper);
+      color: var(--ink);
+      box-shadow: var(--shadow-soft);
+      transform: translateY(-1px);
+    }
+
+    .nav-list {
+      padding: 8px;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      overflow-y: auto;
+      flex: 1;
+    }
+
+    .nav-item {
+      width: 100%;
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 4px 8px;
+      align-items: center;
+      border: 1px solid transparent;
+      border-radius: 8px;
+      background: transparent;
+      color: var(--muted);
+      padding: 8px 12px;
+      text-align: left;
+      font-size: 11px;
+      transition: all .16s ease;
+    }
+
+    .nav-item:hover:not(:disabled) {
+      border-color: var(--line-soft);
+      background: var(--paper-soft);
+      color: var(--ink);
+    }
+
+    .nav-item.active {
+      border-color: var(--line-soft);
+      background: var(--accent-soft);
+      color: var(--ink);
+    }
+
+    .nav-item:disabled {
+      cursor: not-allowed;
+      opacity: .55;
+    }
+
+    .nav-item-title {
+      color: var(--ink);
+      font-family: var(--mono);
+      font-weight: 800;
+    }
+
+    .nav-item-meta {
+      grid-column: 1 / -1;
+      font-size: 11px;
+      color: var(--faint);
+      line-height: 1.45;
+    }
+
+    .nav-dot {
+      width: 16px;
+      height: 8px;
+      border-radius: 999px;
+      background: var(--green);
+    }
+
+    .nav-dot.warn {
+      background: var(--amber);
+    }
+
+    .manuscript {
+      display: flex;
+      flex-direction: column;
+    }
+
+    .review-block {
+      position: relative;
+      border-bottom: 1px solid var(--line-soft);
+      scroll-margin-top: 18px;
+    }
+
+    .review-block:last-child {
+      border-bottom: 0;
+    }
+
+    .review-block.equal {
+      position: relative;
+      padding: 9px 18px 9px 62px;
+      color: var(--muted);
+      font-family: var(--serif);
+      font-size: 14px;
+      line-height: 1.66;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+
+    .review-block.equal::before {
+      content: "";
+      position: absolute;
+      inset: 0 auto 0 0;
+      width: 48px;
+      border-right: 1px solid var(--line-faint);
+      background: linear-gradient(180deg, var(--paper-soft), rgba(244, 243, 238, 0));
+      opacity: .68;
+    }
+
+    .review-block.equal + .review-block.equal {
+      border-top: 1px solid var(--line-faint);
+    }
+
+    .review-block.changed {
+      background: transparent;
+    }
+
+    .review-block.changed::before {
+      content: "";
+      position: absolute;
+      inset: 0 auto 0 0;
+      width: 3px;
+      background: var(--accent);
+      transition: background-color .2s, opacity .2s;
+    }
+
+    .review-block.changed.rejected {
+      background: transparent;
+    }
+
+    .review-block.changed.rejected::before {
+      background: var(--amber);
+      opacity: .85;
+    }
+
+    .review-head {
+      position: absolute;
+      top: 8px;
+      left: 0;
+      right: 10px;
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      z-index: 2;
+      pointer-events: none;
+    }
+
+    .review-label {
+      width: 48px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      pointer-events: none;
+    }
+
+    .review-index {
+      color: var(--faint);
+      font-family: var(--mono);
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: .04em;
+      text-transform: uppercase;
+      line-height: 1;
+      opacity: .9;
+      transition: opacity .16s ease;
+    }
+
+    .review-controls {
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+      pointer-events: none;
+    }
+
+    .review-skip {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 20px;
+      padding: 1px 7px;
+      border: 1px solid var(--line-soft);
+      border-radius: 999px;
+      background: rgba(255, 254, 250, .96);
+      color: var(--muted);
+      font-size: 9px;
+      font-weight: 700;
+      letter-spacing: 0;
+      box-shadow: none;
+      user-select: none;
+      transition: opacity .16s ease, transform .16s ease, border-color .16s ease, background .16s ease, color .16s ease;
+      cursor: pointer;
+      pointer-events: none;
+      opacity: 0;
+      transform: translateY(-2px);
+    }
+
+    .review-block.changed:hover .review-skip,
+    .review-block.changed:focus-within .review-skip,
+    .review-block.changed.rejected .review-skip {
+      opacity: 1;
+      transform: translateY(0);
+      pointer-events: auto;
+    }
+
+    .review-block.changed.rejected .review-index {
+      opacity: .45;
+    }
+
+    .review-skip:hover {
+      border-color: var(--line);
+      background: var(--paper-warm);
+      color: var(--ink);
+    }
+
+    .review-skip.rejected {
+      color: var(--amber);
+      border-color: rgba(140, 90, 0, .2);
+      background: rgba(253, 243, 223, .96);
+      opacity: 1;
+      transform: translateY(0);
+    }
+
+    .review-body {
+      position: relative;
+      padding: 8px 16px 10px 62px;
+      color: var(--ink-soft);
+      font-family: var(--serif);
+      font-size: 14px;
+      line-height: 1.62;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+
+    .review-block.changed.rejected .review-body {
+      color: var(--muted);
+    }
+
+    .seg-del {
+      background: rgba(190, 37, 28, .24);
+      color: inherit;
+      text-decoration: line-through;
+      text-decoration-color: rgba(190, 37, 28, .92);
+      border-radius: 2px;
+    }
+
+    .seg-ins {
+      background: rgba(11, 122, 66, .24);
+      color: inherit;
+      border-radius: 2px;
+    }
+
+    .review-block.changed.rejected .seg-ins {
+      background: transparent;
+      text-decoration: line-through;
+      text-decoration-color: var(--amber);
+    }
+
+    .review-block.changed.rejected .seg-del {
+      background: transparent;
+      text-decoration: none;
+    }
+
+    @media (prefers-color-scheme: dark) {
+      .seg-del { background: rgba(231, 76, 60, .34); }
+      .seg-ins { background: rgba(38, 162, 105, .34); }
+    }
+
+    .empty-editor {
+      padding: 14px 18px 18px 62px;
+      color: var(--muted);
+      font-size: 14px;
+      line-height: 1.7;
+    }
+
+    .toast {
+      position: fixed;
+      left: 50%;
+      bottom: 28px;
+      transform: translate(-50%, 16px);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 12px 20px;
+      border: 1px solid var(--line-soft);
+      border-radius: 999px;
+      background: var(--ink);
+      color: var(--paper);
+      box-shadow: 0 16px 36px rgba(0, 0, 0, .3);
+      font-size: 13px;
+      opacity: 0;
+      pointer-events: none;
+      transition: all .2s cubic-bezier(0.16, 1, 0.3, 1);
+      z-index: 100;
+    }
+
+    .toast.show {
+      opacity: 1;
+      transform: translate(-50%, 0);
+    }
+
+    .toast-icon {
+      color: #2ecc71;
+      font-weight: 700;
+    }
+
+    .toast-icon.error {
+      color: #e74c3c;
+    }
+
+    @media (max-width: 980px) {
+      .workspace { grid-template-columns: 1fr; }
+      .navigator { position: static; max-height: none; }
+      .nav-list {
+        display: flex;
+        flex-direction: row;
+        overflow-x: auto;
+        gap: 6px;
+        padding-bottom: 12px;
+      }
+      .nav-item { min-width: 180px; }
+    }
+
+    @media (max-width: 760px) {
+      body { overflow: auto; height: auto; min-height: 100vh; }
+      .header {
+        align-items: flex-start;
+        flex-direction: column;
+        padding: 14px 16px;
+        gap: 10px;
+      }
+      .title-row { gap: 8px; }
+      .divider { display: none; }
+      .meta { align-items: flex-start; gap: 6px 9px; }
+      .header-actions { width: 100%; justify-content: flex-start; }
+      .button { min-height: 34px; padding: 5px 12px; }
+      .main { overflow: visible; padding: 16px 12px 56px; }
+      .notice { margin-bottom: 10px; }
+      .navigator { display: none; }
+      .document-head { padding: 18px 16px 16px; }
+      .review-head {
+        top: 8px;
+        left: 0;
+        right: 8px;
+      }
+      .review-label {
+        width: 40px;
+      }
+      .review-controls {
+        justify-content: flex-end;
+      }
+      .review-body {
+        padding: 8px 16px 12px 54px;
+        font-size: 14px;
+        line-height: 1.66;
+      }
+      .review-block.equal {
+        padding: 10px 16px 10px 54px;
+        font-size: 14px;
+        line-height: 1.68;
+      }
+      .review-block.equal::before {
+        width: 40px;
+      }
+      .legend-item {
+        width: 100%;
+        justify-content: flex-start;
+      }
+    }
+  </style>
+</head>
+<body>
+  <header class="header">
+    <div class="title-row">
+      <h1>排版变更确认</h1>
+      <div class="divider"></div>
+      <div class="meta">
+        <span>源文件：<strong id="sourceName">--</strong></span>
+        <span class="meta-summary" id="summaryText">--</span>
+        <span class="status-pill" id="statusPill">未加载</span>
+      </div>
+    </div>
+    <div class="header-actions">
+      <button class="button danger" id="cancelButton" disabled>取消本页</button>
+      <button class="button primary" id="applyButton" disabled>应用修正</button>
+    </div>
+  </header>
+
+  <main class="main" id="main">
+    <div class="notice" id="notice">正在加载排版预览。</div>
+    <div class="workspace" id="workspace" hidden>
+      <section class="editor" id="editor" aria-label="排版变更确认"></section>
+      <aside class="navigator" id="navigator" aria-label="变更导航" hidden>
+        <div class="nav-title"><span>Changes</span><span id="overview">--</span></div>
+        <div class="nav-utility">
+          <button class="btn-action" id="includeAllBtn">全部应用</button>
+          <button class="btn-action" id="skipAllBtn">全部跳过</button>
+          <button class="btn-action" id="backToTopBtn">回到顶部</button>
+        </div>
+        <div class="nav-list" id="navList"></div>
+      </aside>
+    </div>
+  </main>
+
+  <div class="toast" id="toast"><span class="toast-icon" id="toastIcon">●</span><span id="toastText">操作成功</span></div>
+
+  <script type="application/json" id="previewData">__POLISH_PREVIEW_DATA__</script>
+  <script>
+    const state = {
+      phase: "loading",
+      previewData: null,
+      blocks: [],
+      changedBlockIndexes: [],
+      sourceName: "--",
+      sourceSha256: "",
+      confirmEndpoint: "/polish-apply",
+      skippedBlocks: new Set(),
+      changedBlockMap: new Map(),
+      changedNavMap: new Map(),
+      navigatorSummary: "--",
+      observer: null,
+      activeChangedBlock: null,
+      pendingActiveBlock: null,
+      pendingActiveTimer: null,
+      messageOverride: null,
+    };
+
+    const dom = {
+      main: document.getElementById("main"),
+      workspace: document.getElementById("workspace"),
+      notice: document.getElementById("notice"),
+      sourceName: document.getElementById("sourceName"),
+      changeCount: document.getElementById("changeCount"),
+      summaryText: document.getElementById("summaryText"),
+      statusPill: document.getElementById("statusPill"),
+      editor: document.getElementById("editor"),
+      navigator: document.getElementById("navigator"),
+      overview: document.getElementById("overview"),
+      navList: document.getElementById("navList"),
+      includeAllBtn: document.getElementById("includeAllBtn"),
+      skipAllBtn: document.getElementById("skipAllBtn"),
+      backToTopBtn: document.getElementById("backToTopBtn"),
+      cancelButton: document.getElementById("cancelButton"),
+      applyButton: document.getElementById("applyButton"),
+      toast: document.getElementById("toast"),
+      toastIcon: document.getElementById("toastIcon"),
+      toastText: document.getElementById("toastText"),
+      previewData: document.getElementById("previewData"),
+    };
+
+    dom.applyButton.addEventListener("click", applyChanges);
+    dom.cancelButton.addEventListener("click", cancelPreview);
+    dom.includeAllBtn.addEventListener("click", function () { setAllChangesIncluded(true); });
+    dom.skipAllBtn.addEventListener("click", function () { setAllChangesIncluded(false); });
+    dom.backToTopBtn.addEventListener("click", function () {
+      dom.main.scrollTo({ top: 0, behavior: "smooth" });
+    });
+
+    init();
+
+    setInterval(function () {
+      fetch("/heartbeat", { method: "GET", cache: "no-store" }).catch(function () {});
+    }, 60000);
+
+    function init() {
+      try {
+        const data = readEmbeddedPreviewData();
+        const changedBlockIndexes = deriveChangedBlockIndexes(data.blocks || []);
+
+        state.previewData = data;
+        state.blocks = Array.isArray(data.blocks) ? data.blocks : [];
+        state.changedBlockIndexes = changedBlockIndexes;
+        state.sourceName = data.source_name || "--";
+        state.sourceSha256 = data.source_sha256 || "";
+        state.confirmEndpoint = data.confirm_endpoint || "/polish-apply";
+        state.phase = changedBlockIndexes.length === 0 ? "clean" : "ready";
+
+        renderWorkspace();
+        bindScrollSync();
+        updateUI();
+      } catch (error) {
+        state.phase = "template-error";
+        state.messageOverride = {
+          tone: "error",
+          text: "加载失败：" + getErrorMessage(error),
+        };
+        updateUI();
+      }
+    }
+
+    function readEmbeddedPreviewData() {
+      const raw = dom.previewData.textContent.trim();
+      if (!raw || raw.startsWith("__")) {
+        throw new Error("此文件是预览模板，请通过 polish.py preview 生成任务专用 HTML。");
+      }
+      return JSON.parse(raw);
+    }
+
+    function deriveChangedBlockIndexes(blocks) {
+      const indexes = [];
+      blocks.forEach(function (block, index) {
+        if (block && block.type === "changed") {
+          indexes.push(index);
+        }
+      });
+      return indexes;
+    }
+
+    function renderWorkspace() {
+      dom.workspace.hidden = false;
+      state.changedBlockMap.clear();
+      state.changedNavMap.clear();
+
+      renderEditor();
+      renderNavigator();
+    }
+
+    function renderEditor() {
+      dom.editor.innerHTML = "";
+
+      const manuscript = document.createElement("div");
+      manuscript.className = "manuscript";
+
+      if (state.blocks.length === 0) {
+        const empty = document.createElement("div");
+        empty.className = "empty-editor";
+        empty.textContent = "未找到可显示的预览内容。";
+        manuscript.appendChild(empty);
+      } else {
+        let changeNumber = 0;
+        state.blocks.forEach(function (block, blockIndex) {
+          if (block.type === "changed") {
+            changeNumber += 1;
+            manuscript.appendChild(createChangedBlock(block, blockIndex, changeNumber));
+          } else {
+            manuscript.appendChild(createEqualBlock(block));
+          }
+        });
+      }
+
+      dom.editor.appendChild(manuscript);
+    }
+
+    function createEqualBlock(block) {
+      const section = document.createElement("section");
+      section.className = "review-block equal";
+      section.textContent = block && typeof block.text === "string" ? block.text : "";
+      return section;
+    }
+
+    function createChangedBlock(block, blockIndex, changeNumber) {
+      const section = document.createElement("section");
+      section.className = "review-block changed";
+      section.id = getChangedBlockId(blockIndex);
+      section.dataset.blockIndex = String(blockIndex);
+
+      const head = document.createElement("div");
+      head.className = "review-head";
+
+      const label = document.createElement("div");
+      label.className = "review-label";
+
+      const index = document.createElement("div");
+      index.className = "review-index";
+      index.textContent = String(changeNumber).padStart(2, "0");
+
+      label.appendChild(index);
+
+      const controls = document.createElement("div");
+      controls.className = "review-controls";
+
+      const skipButton = document.createElement("button");
+      skipButton.type = "button";
+      skipButton.className = "review-skip";
+      skipButton.textContent = "跳过";
+      skipButton.setAttribute("aria-label", "跳过此处变更");
+      skipButton.addEventListener("click", function () {
+        toggleChangedBlock(blockIndex, state.skippedBlocks.has(blockIndex));
+      });
+
+      controls.appendChild(skipButton);
+
+      const body = document.createElement("div");
+      body.className = "review-body";
+      renderSegments(body, block.segments || []);
+
+      head.appendChild(label);
+      head.appendChild(controls);
+      section.appendChild(head);
+      section.appendChild(body);
+
+      state.changedBlockMap.set(blockIndex, { section, skipButton });
+      syncChangedBlockUI(blockIndex);
+
+      return section;
+    }
+
+    function buildExcerpt(block) {
+      const raw = (block.original || block.polished || collectSegmentsText(block.segments || []))
+        .replace(/\s+/g, " ")
+        .trim();
+      if (!raw) {
+        return "空白行或局部排版修正";
+      }
+      return raw.length > 36 ? raw.slice(0, 36) + "…" : raw;
+    }
+
+    function collectSegmentsText(segments) {
+      return (segments || []).map(function (segment) {
+        return segment && typeof segment.text === "string" ? segment.text : "";
+      }).join("");
+    }
+
+    function renderSegments(container, segments) {
+      (segments || []).forEach(function (segment) {
+        if (!segment || typeof segment.text !== "string") {
+          return;
+        }
+        if (segment.type === "equal") {
+          container.appendChild(document.createTextNode(segment.text));
+          return;
+        }
+        const span = document.createElement("span");
+        span.className = segment.type === "delete" ? "seg-del" : "seg-ins";
+        span.textContent = segment.text;
+        container.appendChild(span);
+      });
+    }
+
+    function renderNavigator() {
+      if (state.changedBlockIndexes.length === 0) {
+        dom.navigator.hidden = true;
+        return;
+      }
+
+      dom.navigator.hidden = false;
+      dom.navList.innerHTML = "";
+
+      const fragment = document.createDocumentFragment();
+      let changeNumber = 0;
+
+      state.changedBlockIndexes.forEach(function (blockIndex) {
+        changeNumber += 1;
+        const item = document.createElement("button");
+        item.type = "button";
+        item.className = "nav-item";
+        item.addEventListener("click", function () {
+          scrollToChangedBlock(blockIndex);
+        });
+
+        const title = document.createElement("div");
+        title.className = "nav-item-title";
+        title.textContent = "变更 " + String(changeNumber).padStart(2, "0");
+
+        const dot = document.createElement("span");
+        dot.className = "nav-dot";
+
+        const meta = document.createElement("div");
+        meta.className = "nav-item-meta";
+        meta.textContent = "将应用";
+
+        item.appendChild(title);
+        item.appendChild(dot);
+        item.appendChild(meta);
+
+        state.changedNavMap.set(blockIndex, { item, dot, meta });
+        syncNavigatorItemUI(blockIndex);
+        fragment.appendChild(item);
+      });
+
+      dom.navList.appendChild(fragment);
+    }
+
+    function bindScrollSync() {
+      if (state.observer) {
+        state.observer.disconnect();
+      }
+      if (state.changedBlockIndexes.length === 0) {
+        return;
+      }
+
+      state.observer = new IntersectionObserver(handleIntersections, {
+        root: dom.main,
+        threshold: [0.15, 0.4, 0.7],
+        rootMargin: "-18% 0px -55% 0px",
+      });
+
+      state.changedBlockIndexes.forEach(function (blockIndex) {
+        const entry = state.changedBlockMap.get(blockIndex);
+        if (entry) {
+          state.observer.observe(entry.section);
+        }
+      });
+
+      setActiveChangedBlock(state.changedBlockIndexes[0]);
+    }
+
+    function handleIntersections(entries) {
+      const visible = entries
+        .filter(function (entry) { return entry.isIntersecting; })
+        .sort(function (a, b) {
+          return Math.abs(a.boundingClientRect.top) - Math.abs(b.boundingClientRect.top);
+        });
+
+      if (!visible.length) {
+        return;
+      }
+
+      const blockIndex = Number(visible[0].target.dataset.blockIndex);
+      if (!Number.isNaN(blockIndex)) {
+        if (state.pendingActiveBlock !== null && blockIndex !== state.pendingActiveBlock) {
+          return;
+        }
+        clearPendingActiveBlock();
+        setActiveChangedBlock(blockIndex);
+      }
+    }
+
+    function setActiveChangedBlock(blockIndex) {
+      state.activeChangedBlock = blockIndex;
+      state.changedNavMap.forEach(function (entry, index) {
+        entry.item.classList.toggle("active", index === blockIndex);
+      });
+    }
+
+    function clearPendingActiveBlock() {
+      state.pendingActiveBlock = null;
+      if (state.pendingActiveTimer !== null) {
+        clearTimeout(state.pendingActiveTimer);
+        state.pendingActiveTimer = null;
+      }
+    }
+
+    function scrollToChangedBlock(blockIndex) {
+      const blockEntry = state.changedBlockMap.get(blockIndex);
+      if (!blockEntry) {
+        return;
+      }
+      state.pendingActiveBlock = blockIndex;
+      if (state.pendingActiveTimer !== null) {
+        clearTimeout(state.pendingActiveTimer);
+      }
+      state.pendingActiveTimer = setTimeout(function () {
+        clearPendingActiveBlock();
+      }, 500);
+      setActiveChangedBlock(blockIndex);
+      blockEntry.section.scrollIntoView({ behavior: "smooth", block: "center" });
+    }
+
+    function toggleChangedBlock(blockIndex, included) {
+      clearMessageOverride();
+      if (included) {
+        state.skippedBlocks.delete(blockIndex);
+      } else {
+        state.skippedBlocks.add(blockIndex);
+      }
+      syncChangedBlockUI(blockIndex);
+      syncNavigatorItemUI(blockIndex);
+      updateUI();
+    }
+
+    function setAllChangesIncluded(included) {
+      if (isLockedState()) {
+        return;
+      }
+      clearMessageOverride();
+      state.changedBlockIndexes.forEach(function (blockIndex) {
+        if (included) {
+          state.skippedBlocks.delete(blockIndex);
+        } else {
+          state.skippedBlocks.add(blockIndex);
+        }
+        syncChangedBlockUI(blockIndex);
+        syncNavigatorItemUI(blockIndex);
+      });
+      updateUI();
+    }
+
+    function syncChangedBlockUI(blockIndex) {
+      const entry = state.changedBlockMap.get(blockIndex);
+      if (!entry) {
+        return;
+      }
+
+      const included = !state.skippedBlocks.has(blockIndex);
+      entry.section.classList.toggle("rejected", !included);
+      entry.skipButton.classList.toggle("rejected", !included);
+      entry.skipButton.disabled = isLockedState() || state.phase === "applying";
+      entry.skipButton.textContent = included ? "跳过" : "恢复";
+      entry.skipButton.setAttribute("aria-label", included ? "跳过此处变更" : "恢复应用此处变更");
+    }
+
+    function syncNavigatorItemUI(blockIndex) {
+      const entry = state.changedNavMap.get(blockIndex);
+      if (!entry) {
+        return;
+      }
+      const included = !state.skippedBlocks.has(blockIndex);
+      entry.dot.className = included ? "nav-dot" : "nav-dot warn";
+      entry.item.disabled = state.phase === "applying";
+      const status = included ? "将应用" : "已跳过";
+      entry.meta.textContent = status;
+    }
+
+    function updateUI() {
+      const totalChanges = state.changedBlockIndexes.length;
+      const selectedCount = totalChanges - state.skippedBlocks.size;
+      const skippedCount = state.skippedBlocks.size;
+
+      dom.sourceName.textContent = state.sourceName;
+      dom.summaryText.textContent = buildSummaryText(totalChanges, selectedCount, skippedCount);
+      dom.overview.textContent = totalChanges === 0 ? "无需导航" : "共 " + totalChanges + " 处";
+
+      updateStatusPill(totalChanges, selectedCount, skippedCount);
+      updateNotice(totalChanges, selectedCount, skippedCount);
+      updateActions(totalChanges);
+      updateNavigatorButtons(totalChanges);
+    }
+
+    function buildSummaryText(totalChanges, selectedCount, skippedCount) {
+      if (totalChanges === 0) {
+        return "未检测到需要修正的排版问题";
+      }
+      if (skippedCount === 0) {
+        return "共 " + totalChanges + " 处待确认";
+      }
+      if (selectedCount === 0) {
+        return "共 " + totalChanges + " 处，当前全部跳过";
+      }
+      return "共 " + totalChanges + " 处，应用 " + selectedCount + " 处，跳过 " + skippedCount + " 处";
+    }
+
+    function updateStatusPill(totalChanges, selectedCount, skippedCount) {
+      dom.statusPill.className = "status-pill";
+
+      if (state.phase === "template-error") {
+        dom.statusPill.classList.add("error");
+        dom.statusPill.textContent = "加载失败";
+        return;
+      }
+      if (state.phase === "clean") {
+        dom.statusPill.classList.add("clean");
+        dom.statusPill.textContent = "无需修正";
+        return;
+      }
+      if (state.phase === "applying") {
+        dom.statusPill.classList.add("changed");
+        dom.statusPill.textContent = "正在应用";
+        return;
+      }
+      if (state.phase === "applied") {
+        dom.statusPill.classList.add("applied");
+        dom.statusPill.textContent = "已应用";
+        return;
+      }
+      if (state.phase === "cancelled") {
+        dom.statusPill.classList.add("warn");
+        dom.statusPill.textContent = "已取消";
+        return;
+      }
+      if (state.phase === "stale") {
+        dom.statusPill.classList.add("warn");
+        dom.statusPill.textContent = "预览过期";
+        return;
+      }
+      if (state.messageOverride && state.messageOverride.tone === "error") {
+        dom.statusPill.classList.add("error");
+        dom.statusPill.textContent = "需要重试";
+        return;
+      }
+      if (totalChanges === 0) {
+        dom.statusPill.classList.add("clean");
+        dom.statusPill.textContent = "无需修正";
+        return;
+      }
+      dom.statusPill.classList.add("changed");
+      dom.statusPill.textContent = skippedCount > 0 ? (selectedCount > 0 ? "已筛选" : "全部跳过") : "待确认";
+    }
+
+    function updateNotice(totalChanges, selectedCount, skippedCount) {
+      let tone = "";
+      let text = "";
+      let visible = true;
+
+      if (state.messageOverride) {
+        tone = state.messageOverride.tone;
+        text = state.messageOverride.text;
+      } else if (state.phase === "template-error") {
+        tone = "error";
+        text = "此文件尚未嵌入任务数据。请通过 polish.py preview 重新生成任务专用 HTML。";
+      } else if (state.phase === "clean") {
+        tone = "clean";
+        text = "未检测到需要修正的排版问题。当前页面只做确认展示，不会写入任何修改。";
+      } else if (state.phase === "applying") {
+        text = "正在将已勾选的排版修正写回源文件，请稍候。";
+      } else if (state.phase === "applied") {
+        tone = "clean";
+        text = skippedCount > 0
+          ? "排版修正已写入源文件，未勾选的变更已保持原样。可关闭此页面，回到对话继续。"
+          : "排版修正已写入源文件。可关闭此页面，回到对话继续。";
+      } else if (state.phase === "cancelled") {
+        tone = "warn";
+        text = "本页已取消，不会写入任何修改。若要重新检查，请回到对话并重新打开 preview_url。";
+      } else if (state.phase === "stale") {
+        tone = "warn";
+        text = "源文件在预览生成后已经发生变化，当前预览已过期。请回到对话重新生成 preview_url 后再确认。";
+      } else if (totalChanges === 0) {
+        tone = "clean";
+        text = "未检测到需要修正的排版问题。";
+      } else if (selectedCount === 0) {
+        visible = false;
+      } else {
+        visible = false;
+      }
+
+      dom.notice.hidden = !visible;
+      if (!visible) {
+        return;
+      }
+
+      dom.notice.className = "notice" + (tone ? " " + tone : "");
+      dom.notice.textContent = text;
+    }
+
+    function updateActions(totalChanges) {
+      const locked = isLockedState();
+      const applying = state.phase === "applying";
+      const canApply = !locked && !applying && totalChanges >= 0 && state.phase !== "template-error";
+
+      dom.applyButton.disabled = !canApply || totalChanges === 0;
+      dom.cancelButton.disabled = applying || locked || totalChanges === 0 || state.phase === "template-error";
+
+      dom.applyButton.textContent = state.phase === "applying"
+        ? "正在应用…"
+        : state.phase === "applied"
+          ? "已应用"
+          : totalChanges === 0
+            ? "无需修正"
+            : "应用修正";
+    }
+
+    function updateNavigatorButtons(totalChanges) {
+      const disabled = isLockedState() || state.phase === "applying" || totalChanges === 0;
+      dom.includeAllBtn.disabled = disabled;
+      dom.skipAllBtn.disabled = disabled;
+      dom.backToTopBtn.disabled = state.phase === "applying";
+      if (totalChanges === 0 || state.phase === "template-error") {
+        dom.navigator.hidden = true;
+      }
+    }
+
+    function isLockedState() {
+      return state.phase === "applied" || state.phase === "cancelled" || state.phase === "stale";
+    }
+
+    function cancelPreview() {
+      if (isLockedState() || state.phase === "applying") {
+        return;
+      }
+      state.phase = "cancelled";
+      clearMessageOverride();
+      state.changedBlockIndexes.forEach(function (blockIndex) {
+        syncChangedBlockUI(blockIndex);
+        syncNavigatorItemUI(blockIndex);
+      });
+      updateUI();
+      showToast("已取消，本页不会写入修改");
+    }
+
+    async function applyChanges() {
+      if (state.phase === "applying" || isLockedState() || state.changedBlockIndexes.length === 0) {
+        return;
+      }
+      if (window.location.protocol !== "http:" && window.location.protocol !== "https:") {
+        state.messageOverride = {
+          tone: "error",
+          text: "请通过本地预览 URL 打开此页面后再确认。当前页面仅供查看，无法直接写回文件。",
+        };
+        updateUI();
+        showToast("请改用 preview_url 打开", "error");
+        return;
+      }
+
+      state.phase = "applying";
+      clearMessageOverride();
+      updateUI();
+
+      try {
+        const response = await fetch(state.confirmEndpoint, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            source_sha256: state.sourceSha256,
+            result_text: reconstructText(),
+          }),
+        });
+
+        const result = await response.json();
+        if (!response.ok || !result.ok) {
+          throw new Error(result.error || "应用失败");
+        }
+
+        state.phase = "applied";
+        updateUI();
+        showToast(state.skippedBlocks.size > 0 ? "已应用所选变更，本地预览即将关闭" : "排版修正已应用，本地预览即将关闭");
+      } catch (error) {
+        const message = getErrorMessage(error);
+        if (message.includes("File has changed since preview was generated")) {
+          state.phase = "stale";
+          clearMessageOverride();
+          updateUI();
+          showToast("预览已过期，请重新生成", "error");
+          return;
+        }
+
+        state.phase = "ready";
+        state.messageOverride = {
+          tone: "error",
+          text: "应用失败：" + message + "。可检查本地预览服务是否仍在运行，然后重试。",
+        };
+        updateUI();
+        showToast(message || "应用失败", "error");
+      }
+    }
+
+    function reconstructText() {
+      return state.blocks.map(function (block, index) {
+        if (block.type === "equal") {
+          return typeof block.text === "string" ? block.text : "";
+        }
+        return state.skippedBlocks.has(index)
+          ? (typeof block.original === "string" ? block.original : "")
+          : (typeof block.polished === "string" ? block.polished : "");
+      }).join("");
+    }
+
+    function getChangedBlockId(blockIndex) {
+      return "change-block-" + blockIndex;
+    }
+
+    function clearMessageOverride() {
+      state.messageOverride = null;
+    }
+
+    function getErrorMessage(error) {
+      if (!error) {
+        return "未知错误";
+      }
+      if (typeof error === "string") {
+        return error;
+      }
+      return error.message || String(error);
+    }
+
+    let toastTimer;
+    function showToast(message, type) {
+      type = type || "success";
+      dom.toastText.textContent = message;
+      dom.toastIcon.className = type === "success" ? "toast-icon" : "toast-icon error";
+      dom.toastIcon.textContent = type === "success" ? "●" : "!";
+      dom.toast.classList.add("show");
+      clearTimeout(toastTimer);
+      toastTimer = setTimeout(function () {
+        dom.toast.classList.remove("show");
+      }, type === "error" ? 3600 : 1900);
+    }
+  </script>
+</body>
+</html>

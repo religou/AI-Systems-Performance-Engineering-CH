@@ -1,0 +1,42 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+*.local
+.review-host/
+target/
+.superpowers/
+
+# Vendored library build artifacts
+vendor/libghostty-vt/zig-out/
+vendor/libghostty-vt/.zig-cache/
+vendor/libghostty-vt/build-cmake/
+vendor/libghostty-vt/CMakeCache.txt
+vendor/libghostty-vt/CMakeFiles/
+vendor/libghostty-vt/.agents/
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Python cache
+__pycache__/
+**/scripts/__pycache__/
+
+# Local backend secrets
+**/scripts/node_modules/
