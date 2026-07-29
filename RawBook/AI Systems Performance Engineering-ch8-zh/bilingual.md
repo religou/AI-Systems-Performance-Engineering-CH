@@ -1,0 +1,1797 @@
+# Chapter 8. Occupancy Tuning, Warp Efficiency, and Instruction-Level Parallelism
+
+# 第 8 章：占用率调优、Warp 效率与指令级并行
+
+Modern GPU-accelerated workloads are pushing hardware to its limits. Multi-die GPUs like Blackwell connect multiple reticle-limited dies with a 10 TB/s NV-HBI link and increase L2 to 126 MB. These hardware design choices materially change memory-vs-compute tradeoffs and occupancy sweet spots. This makes profiling and optimization even more critical than ever. Building on the fundamentals of memory optimizations, we now turn to advanced latency-hiding techniques and throughput enhancements designed to fully leverage the full power of modern GPUs.
+
+现代 GPU 加速的工作负载正把硬件推向极限。像 Blackwell 这样的多裸片 GPU 用 10 TB/s 的 NV-HBI 链路连接多个受限于光罩尺寸的裸片，并把 L2 增大到 126 MB。这些硬件设计选择实质性地改变了内存与计算之间的权衡，也改变了占用率的最佳区间。这使得剖析与优化比以往任何时候都更加关键。在内存优化的基础之上，我们现在转向更高阶的延迟隐藏技术与吞吐增强手段，目标是充分释放现代 GPU 的全部性能。
+
+We will focus on identifying performance bottlenecks and then applying a systematic set of optimization strategies to eliminate them one by one. Key themes in this chapter include tuning occupancy, optimizing warp efficiency, and increasing instruction-level parallelism.
+
+我们将聚焦于识别性能瓶颈，然后运用一套系统化的优化策略把它们逐个消除。本章的关键主题包括调优占用率、优化 warp 效率，以及提升指令级并行。
+
+By the end of the chapter, you will be able to identify root causes of GPU underutilization—as well as apply the right combination of optimizations. We will also prepare you for more advanced techniques like kernel fusion and pipelining with primitives like CUDA Graphs and CUDA streams, which we cover in subsequent chapters.
+
+读完本章，你将能够识别 GPU 利用不足的根本原因，并施加恰当的优化组合。我们还会为你铺垫更高阶的技术，比如核函数融合，以及借助 CUDA Graphs 和 CUDA streams 等原语实现的流水线化——这些内容将在后续章节中展开。
+
+While our focus is higher-level languages like CUDA C++ and AI frameworks like PyTorch, the principles of profiling and tuning apply at all levels of the stack right down to the hardware. As such, understanding low-level hardware performance remains critical for diagnosing bottlenecks that higher-level abstractions make difficult to fully resolve.
+
+虽然我们的关注点是 CUDA C++ 这类较高层语言以及 PyTorch 这类 AI 框架，但剖析与调优的原理适用于技术栈的所有层级，一直到硬件层。因此，理解底层硬件性能对于诊断那些高层抽象难以彻底解决的瓶颈仍然至关重要。
+
+## Profiling and Diagnosing GPU Bottlenecks
+
+## 剖析并诊断 GPU 瓶颈
+
+Before optimizing, we must first identify the bottlenecks in our code to determine which hardware or software resource is limiting our performance. Modern NVIDIA GPUs are complex, and a slowdown could come from many sources, including memory bandwidth, memory latency, instruction throughput, synchronization overheads, insufficient parallelism, host-device transfer delays, and more.
+
+在优化之前，我们必须先识别代码中的瓶颈，以确定是哪种硬件或软件资源在限制我们的性能。现代 NVIDIA GPU 十分复杂，性能下降可能来自诸多方面，包括内存带宽、内存延迟、指令吞吐、同步开销、并行度不足、主机与设备之间的传输延迟等等。
+
+NVIDIA’s profiling ecosystem includes Nsight Systems (command-line interface nsys) and Nsight Compute (command-line interface ncu). Nsight Systems captures a system-level timeline of CPU threads, GPU kernels, and memory transfers. It can also capture Python backtraces and Python sampling.
+
+NVIDIA 的剖析生态包括 Nsight Systems（命令行接口 nsys）和 Nsight Compute（命令行接口 ncu）。Nsight Systems 捕获 CPU 线程、GPU 核函数和内存传输的系统级时间线，还能捕获 Python 回溯栈和 Python 采样。
+
+Combined with PyTorch profiler and various visualization tools, Nsight Systems and Nsight Compute can help you diagnose kernel performance bottlenecks, analyze roofline plots, and measure the effectiveness of your iterative optimization efforts.
+
+结合 PyTorch 剖析器和各类可视化工具，Nsight Systems 与 Nsight Compute 可以帮助你诊断核函数性能瓶颈、分析 Roofline 图，并衡量迭代优化工作的成效。
+
+### Nsight Systems Timeline View
+
+### Nsight Systems 时间线视图
+
+The Nsight Systems timeline view helps pinpoint concurrency issues, transfer overhead, and idle periods. For example, run the following code to produce a detailed timeline showing kernel launch overlaps, CPU preparation gaps, data transfer timings, and NVTX-marked ranges:
+
+Nsight Systems 时间线视图有助于精准定位并发问题、传输开销和空闲时段。例如，运行下面的代码即可生成一份详细的时间线，展示核函数启动的重叠、CPU 准备阶段的空隙、数据传输时序，以及 NVTX 标记的范围：
+
+```
+nsys profile \
+    --trace=... \
+    --capture-range=... \
+    --force-overwrite=true \
+    <application>
+```
+
+```
+nsys profile \
+    --trace=... \
+    --capture-range=... \
+    --force-overwrite=true \
+    <application>
+```
+
+In addition, the Nsight Systems GUI lets you interactively inspect the timeline. It visualizes CPU threads, GPU kernels, and even user-defined NVTX ranges with zoom and pan features for detailed analysis (see Figure 8-1).
+
+此外，Nsight Systems 的 GUI 允许你交互式地检查时间线。它可视化 CPU 线程、GPU 核函数，乃至用户自定义的 NVTX 范围，并提供缩放与平移功能以便细致分析（见图 8-1）。
+
+Remember that NVTX annotations are essential for complex applications. Use NVTX ranges in your code to mark regions of interest. You can then use Nsight Systems to capture range profiles. And while the CUDA profiler Start and Stop API is supported for capture control, NVTX ranges are the recommended mechanism for framework workflows. For instance, you can use NVTX range push/pop, available using torch.cuda.nvtx in PyTorch, to label phases such as “forward pass” and “backprop.” This makes the Nsight Systems timeline far more interpretable since the profiler can capture the performance-critical iterations and clearly delineate key computation segments.
+
+请记住，对于复杂应用，NVTX 注解不可或缺。在代码中用 NVTX 范围标记感兴趣的区域，然后就能用 Nsight Systems 捕获这些范围的剖析数据。虽然 CUDA 剖析器的 Start 与 Stop API 也支持捕获控制，但对于框架化的工作流，推荐使用 NVTX 范围这一机制。例如，你可以使用 NVTX 范围的 push/pop（在 PyTorch 中通过 torch.cuda.nvtx 获得）来标注诸如“前向传播”和“反向传播”之类的阶段。这会让 Nsight Systems 时间线更易解读，因为剖析器能够捕获性能关键的迭代，并清晰地界定关键的计算段。
+
+![Figure 8-1. Nsight Systems interactive UI (source: https://oreil.ly/YEiWS)](AI%20Systems%20Performance%20Engineering-ch8_images/figure-8-1.png)
+
+![图 8-1. Nsight Systems 交互式 UI（来源：https://oreil.ly/YEiWS）](AI%20Systems%20Performance%20Engineering-ch8_images/figure-8-1.png)
+
+### Profiling and Tuning the Data Pipeline
+
+### 剖析并调优数据管线
+
+As mentioned earlier, Nsight Systems provides a high-level view of the entire pipeline, including the data loading and processing steps. For instance, if you see the GPU idle while the CPU is busy preparing data or running augmentation, common in training loops, the bottleneck might not be the GPU kernel but the data pipeline itself.
+
+如前所述，Nsight Systems 提供整条管线的高层视图，包括数据加载与处理步骤。举例来说，如果你看到 GPU 空闲而 CPU 正忙于准备数据或运行数据增强（这在训练循环中很常见），那么瓶颈也许并不在 GPU 核函数，而在数据管线本身。
+
+For scenarios in which the bottleneck is the data pipeline on a realistic and representative dataset, you can tune the number of data loader threads, overlap CPU preprocessing with GPU compute using double buffering, or move more preprocessing onto the GPU.
+
+对于瓶颈落在数据管线、且面向真实且有代表性数据集的场景，你可以调整数据加载器线程的数量，用双缓冲把 CPU 预处理与 GPU 计算重叠起来，或者把更多预处理搬到 GPU 上。
+
+> Always ensure that what you perceive as a “GPU performance issue” is not actually caused by something upstream or downstream of the kernel execution like data loading.
+
+> 一定要确认你所认为的“GPU 性能问题”并非实际上由核函数执行的上游或下游环节（比如数据加载）所引起。
+
+With a clear picture from profiling, we can now proceed to address specific bottlenecks. The next sections cover the core optimization techniques in detail. We’ll start with occupancy tuning since a sufficient supply of warps is fundamental to hiding latency and maximizing throughput.
+
+有了剖析给出的清晰图景，我们现在可以着手处理具体的瓶颈。接下来的几节会详细介绍核心优化技术。我们会从占用率调优讲起，因为充足的 warp 供给是隐藏延迟、最大化吞吐的根本。
+
+### Nsight Compute and Roofline Analysis
+
+### Nsight Compute 与 Roofline 分析
+
+Nsight Compute (ncu), on the other hand, is a profiler that collects in-depth metrics for individual kernels. For instance, it tracks achieved occupancy, issued warp instructions per cycle, memory throughput (GB/s), utilization of execution units, and many others. Together, these paint a complete picture of your system’s performance profile.
+
+Nsight Compute（ncu）则是一款为单个核函数收集深入指标的剖析器。例如，它会跟踪实测占用率、每周期发射的 warp 指令数、内存吞吐（GB/s）、执行单元的利用率等诸多指标。这些指标合在一起，勾勒出你系统性能的完整画像。
+
+These metrics are organized into sections such as memory, compute, and throughput, etc. Nsight Compute’s automated analysis rules will flag inefficiencies such as low-memory utilization and divergent branches—and even provide optimization hints. These built-in rules are updated continuously for new GPU architectures. They can quickly highlight if you are memory bound, latency bound, etc., based on metrics like FLOPS per byte ratios, stall reasons, etc.
+
+这些指标被组织成内存、计算、吞吐等若干区段。Nsight Compute 的自动分析规则会标记出诸如内存利用率偏低、分支分歧之类的低效之处，甚至给出优化提示。这些内置规则会针对新的 GPU 架构持续更新。它们能根据每字节 FLOPS 比率、停顿原因等指标，快速指出你是访存受限、延迟受限，还是别的什么情况。
+
+Nsight Compute includes a Roofline analysis section as well as automated guidance. This can plot your kernel’s achieved FLOPS against hardware rooflines—and even highlight if you are near the memory bandwidth or compute limits.
+
+Nsight Compute 还包含 Roofline 分析区段以及自动化指导。它能把你核函数实测的 FLOPS 与硬件的屋顶线对照绘制，甚至在你接近内存带宽或计算上限时予以标注。
+
+Remember that the memory-versus-compute distinction is quantified using the Roofline model, which plots kernel performance against hardware ceilings for memory bandwidth and compute throughput. Nsight Compute now directly provides Roofline analysis, showing each kernel’s achieved GFLOPS relative to peak and its arithmetic intensity (FLOPS per byte). A kernel falling below the memory roof indicates memory-bound behavior, while one near the compute roof is ALU bound. Use the Roofline section in Nsight Compute to obtain arithmetic intensity (FLOPs/byte) and FLOPs by precision directly. Compare this to the hardware’s theoretical peak FLOPS per byte, you can see how far below the roofline the kernel is operating. An example Roofline chart is shown in Figure 8-2.
+
+请记住，内存与计算的区分是用 Roofline 模型来量化的，它把核函数性能对照内存带宽和计算吞吐这两条硬件天花板来绘制。Nsight Compute 现在直接提供 Roofline 分析，展示每个核函数相对峰值实测到的 GFLOPS 及其算术强度（每字节 FLOPS）。落在内存屋顶之下的核函数意味着访存受限的行为，而接近计算屋顶的核函数则是 ALU 受限。使用 Nsight Compute 中的 Roofline 区段可以直接得到算术强度（FLOPs/byte）以及按精度划分的 FLOPs。把它与硬件理论上每字节峰值 FLOPS 相比较，你就能看出核函数运行时距离屋顶线还差多远。图 8-2 展示了一个 Roofline 图示例。
+
+![Figure 8-2. Roofline chart shown in the Nsight Compute UI (https://oreil.ly/wUbIz)](AI%20Systems%20Performance%20Engineering-ch8_images/figure-8-2.png)
+
+![图 8-2. Nsight Compute UI 中展示的 Roofline 图（https://oreil.ly/wUbIz）](AI%20Systems%20Performance%20Engineering-ch8_images/figure-8-2.png)
+
+It’s often effective to first use Nsight Systems to find hot kernels or bottleneck operations on the timeline. Then, you can zoom into each of these kernels with Nsight Compute to perform a more fine-grained analysis and diagnosis. This two-step workflow, moving from a system-wide view to a kernel-level deep dive is a common approach to handling complex GPU performance debugging and tuning.
+
+通常一个有效的做法是：先用 Nsight Systems 在时间线上找出热点核函数或成为瓶颈的操作。然后，你可以用 Nsight Compute 放大观察这些核函数中的每一个，做更细粒度的分析与诊断。这种从全系统视图走向核函数级深入的两步式工作流，是处理复杂 GPU 性能调试与调优的常见方法。
+
+### PyTorch Profiler and Visualization Tools
+
+### PyTorch 剖析器与可视化工具
+
+When using high-level frameworks like PyTorch, the torch.profiler API can collect similar performance metrics during model training/inference. The PyTorch profiler uses the Kineto library to actually perform the data collection under the hood.
+
+在使用 PyTorch 这类高层框架时，torch.profiler API 可以在模型训练/推理期间收集类似的性能指标。PyTorch 剖析器在底层实际是用 Kineto 库来完成数据收集的。
+
+Kineto integrates with CUDA’s Performance Tools Interface (CUPTI) backend to capture operator-wise execution times, GPU kernel launches, memory copies, and hardware counter metrics. It also integrates with Linux perf to record CPU events. Kineto merges all of this information into a coherence, time-ordered trace, which can be visualized using the PyTorch profiler UI, Nsight Systems GUI, or just a Chrome browser (e.g., Chrome tracing format). An example Chrome tracing visualization is shown in Figure 8-3.
+
+Kineto 与 CUDA 的 Performance Tools Interface（CUPTI）后端集成，以捕获按算子划分的执行时间、GPU 核函数启动、内存拷贝以及硬件计数器指标。它还与 Linux perf 集成以记录 CPU 事件。Kineto 把所有这些信息合并成一份连贯、按时间排序的追踪记录，可以用 PyTorch 剖析器 UI、Nsight Systems GUI，或者仅用 Chrome 浏览器（例如 Chrome tracing 格式）来可视化。图 8-3 展示了一个 Chrome tracing 可视化的示例。
+
+![Figure 8-3. Chrome tracing visualization generated by the PyTorch profiler](AI%20Systems%20Performance%20Engineering-ch8_images/figure-8-3.png)
+
+![图 8-3. 由 PyTorch 剖析器生成的 Chrome tracing 可视化](AI%20Systems%20Performance%20Engineering-ch8_images/figure-8-3.png)
+
+PyTorch profiler allows you to identify bottleneck operations in your model code directly. For example, you can profile a training loop with torch.profiler.profile(..., with_flops=True, profile_memory=True) to record memory usage and to estimate FLOPs for supported operators such as matrix multiplication. (Note: These are formula-based estimates at the operator level rather than per-kernel hardware counters.) Such integration makes it easier to bridge the gap between PyTorch model code and low-level CUDA performance analysis.
+
+PyTorch 剖析器让你能够直接在模型代码中识别成为瓶颈的操作。例如，你可以用 torch.profiler.profile(..., with_flops=True, profile_memory=True) 来剖析一个训练循环，以记录内存用量，并为矩阵乘法等受支持的算子估算 FLOPs。（注：这些是算子层面基于公式的估算，而非逐核函数的硬件计数器读数。）这种集成让弥合 PyTorch 模型代码与底层 CUDA 性能分析之间的鸿沟变得更容易。
+
+Modern versions of Nsight Systems can collect Python backtrace sampling and also provide a PyTorch-focused mode, which supports Python call-stack sampling and a PyTorch domain for more correlated tracing.” This helps correlate framework activity with the system timeline. Nsight Compute correlates to CUDA C or C++ source and PTX or SASS. You can compile device code with -lineinfo to enable source line mapping. To correlate model code with kernels, use NVTX ranges from Python using torch.cuda.nvtx. In addition, modern versions of Nsight Compute provide a source view, which includes instruction mix—as well as a throughput breakdown that helps pinpoint the source code lines impacted by stalls and throughput limitations.
+
+现代版本的 Nsight Systems 能够收集 Python 回溯栈采样，还提供一种以 PyTorch 为中心的模式，支持 Python 调用栈采样，并提供一个 PyTorch 域以获得更强关联的追踪。这有助于把框架活动与系统时间线关联起来。Nsight Compute 则关联到 CUDA C 或 C++ 源码以及 PTX 或 SASS。你可以用 -lineinfo 编译设备代码以启用源码行映射。要把模型代码与核函数关联起来，可从 Python 中使用 torch.cuda.nvtx 的 NVTX 范围。此外，现代版本的 Nsight Compute 提供了源码视图，其中包含指令构成，以及一份吞吐分解，帮助精准定位受停顿和吞吐限制影响的源码行。
+
+> The lack of capturing Python information traditionally discouraged PyTorch developers from using Nsight Systems/Compute. However, if you are using PyTorch/Python, it’s worth revisiting these tools to provide a more holistic and correlated analysis with the rest of the system.
+
+> 由于传统上无法捕获 Python 信息，PyTorch 开发者一直不太愿意使用 Nsight Systems/Compute。然而，如果你在使用 PyTorch/Python，值得重新审视这些工具，以获得与系统其余部分更全面、更强关联的分析。
+
+This section outlines a workflow for diagnosing GPU bottlenecks, including how to interpret key profiler metrics and what they imply about the bottleneck type. We will focus on Nsight Compute for deep-dive kernel analysis, including warp stalls and memory throughput—and Nsight Systems for high-level application profiling, including concurrency and CPU-GPU overlap.
+
+本节勾勒出一套诊断 GPU 瓶颈的工作流，包括如何解读关键的剖析器指标，以及它们对瓶颈类型意味着什么。我们会把重点放在用 Nsight Compute 做深入的核函数分析（包括 warp 停顿和内存吞吐），以及用 Nsight Systems 做高层应用剖析（包括并发和 CPU-GPU 重叠）。
+
+### Profiler-Guided Analysis
+
+### 剖析器引导的分析
+
+The key is to use all of these insights to guide your next steps since different bottlenecks require different optimizations. For instance, you can take advantage of Nsight Compute’s guided analysis rules, which might flag “Memory Bound: L2 transactions per FLOP high” or “Compute Bound: issue stall reasons indicate pipe contention.”
+
+关键在于利用所有这些洞见来指导你的下一步行动，因为不同的瓶颈需要不同的优化。例如，你可以借助 Nsight Compute 的引导式分析规则，它可能会标记“Memory Bound: L2 transactions per FLOP high”或“Compute Bound: issue stall reasons indicate pipe contention”。
+
+These rules are updated for each architecture, including Blackwell. They can quickly confirm whether a bottleneck is in memory throughput, instruction dispatch, latency hiding, etc. This can direct you to the most relevant metrics and improve your bottleneck time-to-resolution.
+
+这些规则会针对每一代架构（包括 Blackwell）更新。它们能快速确认瓶颈是在内存吞吐、指令派发、延迟隐藏，还是别的地方。这能把你引向最相关的指标，缩短瓶颈的解决时间。
+
+> Nsight Systems and Nsight Compute are constantly updated to the latest GPU architectures to assist performance engineers in diagnosing and fixing performance issues when migrating workloads to newer GPU generations.
+
+> Nsight Systems 与 Nsight Compute 会持续更新以适配最新的 GPU 架构，帮助性能工程师在把工作负载迁移到更新一代 GPU 时诊断并修复性能问题。
+
+## Analyzing Warp Stall Reasons with Nsight Compute
+
+## 用 Nsight Compute 分析 Warp 停顿原因
+
+As discussed in Chapter 6, NVIDIA GPUs execute warps, or groups of 32 threads, in SIMT fashion. If warps are frequently pausing instead of issuing instructions, the profiler categorizes the reasons why.
+
+正如第 6 章所讨论的，NVIDIA GPU 以 SIMT 方式执行 warp，即以 32 个线程为一组来执行。如果 warp 频繁地暂停而不是发射指令，剖析器会对其原因加以归类。
+
+One of the most insightful views in Nsight Compute is the Warp State Statistics breakdown for a kernel. This is sometimes called the *warp stall reasons*. By examining these stall reasons, you can often pinpoint the limiting factor.
+
+Nsight Compute 中最具洞察力的视图之一，是针对某个核函数的 Warp 状态统计（Warp State Statistics）分解。它有时被称为 *warp 停顿原因*。通过审视这些停顿原因，你往往能精准定位限制因素。
+
+There are a few different types of warp stalls: memory-related, execution dependency, execution contention, and others like texture-cache-related stalls. Let’s take a look at each of these.
+
+warp 停顿有几种不同类型：与内存相关的、执行依赖的、执行争用的，以及其他诸如与纹理缓存相关的停顿。让我们逐一来看。
+
+### Memory-Related Stalls
+
+### 与内存相关的停顿
+
+If a kernel is waiting on global memory loads, Nsight Compute reports a high percentage of “Stall: Long Scoreboard” cycles. The scoreboard tracks each warp’s outstanding memory requests, so *Long Scoreboard* indicates warps frequently waiting on the high latency of global DRAM loads, as shown in Figure 8-4.
+
+如果一个核函数在等待全局内存加载，Nsight Compute 会报告较高百分比的“Stall: Long Scoreboard”周期。记分板跟踪每个 warp 未完成的内存请求，因此 *Long Scoreboard* 表示 warp 频繁地在等待全局 DRAM 加载的高延迟，如图 8-4 所示。
+
+![Figure 8-4. Long Scoreboard stall caused by waiting on high-latency global memory accesses (e.g., waiting for data fetched from device memory into registers, or for spilled local memory to be written to/from device memory)](AI%20Systems%20Performance%20Engineering-ch8_images/figure-8-4.png)
+
+![图 8-4. 由等待高延迟全局内存访问所引起的 Long Scoreboard 停顿（例如，等待数据从设备内存取入寄存器，或等待溢出的局部内存在设备内存之间读写完成）](AI%20Systems%20Performance%20Engineering-ch8_images/figure-8-4.png)
+
+Similarly, a *Short Scoreboard* stall is caused by waiting on memory transfers between shared memory and the registers. This is shown in Figure 8-5.
+
+类似地，*Short Scoreboard* 停顿是由等待共享内存与寄存器之间的内存传输所引起的。如图 8-5 所示。
+
+![Figure 8-5. Short Scoreboard stall caused by high-latency data transfers between shared memory and the registers](AI%20Systems%20Performance%20Engineering-ch8_images/figure-8-5.png)
+
+![图 8-5. 由共享内存与寄存器之间高延迟数据传输所引起的 Short Scoreboard 停顿](AI%20Systems%20Performance%20Engineering-ch8_images/figure-8-5.png)
+
+Similarly, metrics labeled “Stall: Memory Throttle” mean the load/store pipelines are saturated so that no additional memory requests can be issued because the hardware’s memory queues are full. “Stall: Not Selected” means that although warps are eligible to issue, they must wait for free memory transaction slots before they can proceed. Whenever these memory-related stall reasons dominate your stall profile, it is a clear sign the kernel is memory bound.
+
+类似地，标记为“Stall: Memory Throttle”的指标意味着 load/store 流水线已饱和，以至于无法再发射额外的内存请求，因为硬件的内存队列已满。“Stall: Not Selected”意味着尽管 warp 有资格发射，但它们必须等待空闲的内存事务槽才能继续。每当这些与内存相关的停顿原因主导了你的停顿画像时，就明确地表明核函数是访存受限的。
+
+> Use Nsight Compute’s source code view to highlight code impacted by scoreboard dependencies and other hardware limitations (e.g., special function unit throughput, etc.).
+
+> 使用 Nsight Compute 的源码视图，可以高亮显示受记分板依赖及其他硬件限制（例如特殊功能单元吞吐等）影响的代码。
+
+### Execution-Dependency Stalls
+
+### 执行依赖停顿
+
+A high fraction of “Stall: Exec Dependency” means that warps are often waiting on the results of previous instructions. For instance, one instruction depends on the output of a prior instruction that has not yet completed. This is usually a sign of insufficient instruction-level parallelism within each thread—or an ALU latency bottleneck.
+
+“Stall: Exec Dependency”占比高，意味着 warp 经常在等待前面指令的结果。例如，某条指令依赖于一条尚未完成的先前指令的输出。这通常是每个线程内指令级并行不足的迹象，或者是一个 ALU 延迟瓶颈。
+
+In a simple sequence of dependent arithmetic operations, later instructions must wait for earlier ones to finish. This causes the warp to go idle. If Exec Dependency stalls dominate, the kernel is likely latency bound waiting on compute. In other words, each thread’s instruction pipeline isn’t busy enough due to sequential dependencies.
+
+在一串简单的相互依赖的算术操作中，后面的指令必须等待前面的完成。这会使 warp 陷入空闲。如果 Exec Dependency 停顿占据主导，核函数很可能是在等待计算而延迟受限的。换句话说，由于顺序依赖，每个线程的指令流水线不够繁忙。
+
+### Execution Unit Contention
+
+### 执行单元争用
+
+If you see significant “Stall: Compute Unit Busy”—or simply very high active utilization of the FP32 CUDA cores or Tensor Cores—the kernel is likely compute bound. In this case, the math units (FP32/FP64 ALUs, Tensor Cores, etc.) are saturated. Specifically, warps are ready to execute more instructions, but the execution units can’t service them any faster. This often manifests as near-peak “ALU pipe busy” metrics and can correlate with high power usage. A related stall reason on some GPUs is “Stall: Math Pipe Throttle,” which means that warps are waiting because the math pipelines are fully occupied on every cycle.
+
+如果你看到明显的“Stall: Compute Unit Busy”，或者干脆就是 FP32 CUDA 核心或 Tensor Core 的活跃利用率非常高，那么核函数很可能是计算受限的。在这种情况下，数学单元（FP32/FP64 ALU、Tensor Core 等）已经饱和。具体来说，warp 已准备好执行更多指令，但执行单元无法更快地为它们服务。这常常表现为接近峰值的“ALU pipe busy”指标，并可能与高功耗相关。某些 GPU 上一个相关的停顿原因是“Stall: Math Pipe Throttle”，它意味着 warp 正在等待，因为数学流水线在每个周期都被完全占用。
+
+### Other Stall Reasons
+
+### 其他停顿原因
+
+While the previous stall reasons are the most common culprits, there are many other less common stall categories, including instruction fetch stalls, texture unit stalls, synchronization stalls, etc. For instance, “Stall: Memory Dependency” is similar to Long Scoreboard in which an operation is waiting on a prior memory operation.
+
+虽然前面这些停顿原因是最常见的元凶，但还有许多不那么常见的停顿类别，包括取指停顿、纹理单元停顿、同步停顿等等。例如，“Stall: Memory Dependency”类似于 Long Scoreboard，也是某个操作在等待先前的内存操作。
+
+“Stall: Texture Throttle” indicates a bottleneck in the texture caching subsystem. “No Eligible” or “Idle” indicates the warp scheduler had no warps ready to issue at a given cycle. This is often due to a prior synchronization—or simply not enough warps launched.
+
+“Stall: Texture Throttle”表明纹理缓存子系统存在瓶颈。“No Eligible”或“Idle”表明 warp 调度器在某个给定周期没有任何 warp 可供发射。这往往是由于先前的同步，或者干脆是启动的 warp 数量不足。
+
+In practice, you don’t need to memorize every stall reason. Instead, look at the largest portions of the stall breakdown. If memory-related stalls dominate, it’s memory bound. If execution dependency dominates, it’s latency bound on ALU.
+
+在实践中，你不必记住每一种停顿原因。相反，只需查看停顿分解中占比最大的部分。如果与内存相关的停顿占主导，就是访存受限。如果执行依赖占主导，就是 ALU 上的延迟受限。
+
+If there are almost no stalls and near 100% pipeline active, it’s likely compute bound. If warps are often “not selected” or idle, it could indicate insufficient parallel work or an occupancy issue. By examining the warp stall breakdown for your kernel, you can narrow down the bottleneck category.
+
+如果几乎没有停顿且流水线接近 100% 活跃，那很可能是计算受限。如果 warp 经常“未被选中”或空闲，可能表明并行工作不足或存在占用率问题。通过审视你核函数的 warp 停顿分解，你就能把瓶颈类别缩小范围。
+
+> Nsight Compute provides these stall metrics per kernel launch. Make sure to profile representative workloads. A tiny test kernel might not exhibit the same stall profile as your real application. Always collect data from realistic runs before drawing conclusions.
+
+> Nsight Compute 会按每次核函数启动提供这些停顿指标。务必剖析有代表性的工作负载。一个极小的测试核函数可能不会呈现出与你真实应用相同的停顿画像。在得出结论之前，务必从贴近真实的运行中收集数据。
+
+Table 8-1 shows a list of common warp stall reasons, their typical interpretation, and possible optimization approaches.
+
+表 8-1 列出了常见的 warp 停顿原因、它们的典型解读，以及可能的优化途径。
+
+Table 8-1. Common warp stall reasons and optimization hints
+
+表 8-1. 常见的 warp 停顿原因与优化提示
+
+| Warp stall reason | Meaning/cause | Potential optimizations |
+| --- | --- | --- |
+| Execution dependency | Warp is stalled on a prior, dependent instruction. This often indicates insufficient instruction-level parallelism (ILP) within the thread. | Increase ILP (do independent work in the same thread). Unroll loops or reorder instructions so that long-latency operations (like multiplies or complex math) have other work to overlap with. If ILP is maxed and still stalling, rely on more warps (occupancy) to hide the latency. |
+| Memory dependency (Long Scoreboard stall) | The warp is waiting on memory loads (“long-latency”) to complete before it can proceed. No other work in the warp can proceed until data arrives. | Hide memory latency by having more warps ready to run, or higher occupancy, so that other warps can run while this warp waits. Or use asynchronous memory prefetch to copy data to shared memory, then continue computing. This will overlap memory operations with computation. To minimize latency, make sure that memory accesses are efficient, use proper coalescing, and exploit proper cache hierarchies. On modern GPUs, you should use the Tensor Memory Accelerator (TMA) for bulk multidimensional copies so memory movement overlaps compute with low thread overhead. |
+| Synchronization (barrier) | Warp is waiting at a __syncthreads() or other synchronization, idle until all threads reach the barrier. Often indicates either frequent synchronization or load imbalance (some warps arrive earlier and wait). | Reduce unnecessary synchronization. Reexamine the algorithm for ways to combine phases or use fine-grained sync. Ensure work is evenly distributed so warps reach barriers at roughly the same time. In some cases, use newer sync primitives (e.g., warp-level sync or cluster sync) to limit scope of synchronization. |
+| Instruction fetch/issue | Warp is stalled waiting to fetch the next instruction (could be an instruction cache miss or pipeline issue) or not issued because the required execution pipe was busy. This can happen with very large kernels or under certain pipeline contention scenarios. | If instruction cache misses are an issue, consider reducing kernel size (split kernel or avoid excessive unrolling that blows up code size). If pipeline issue (one type of instruction saturating a functional unit), try to mix instruction types or again use ILP to utilize different pipelines. |
+| Not selected (scheduler) | The warp is ready but was not selected to issue in that cycle (scheduler picked another warp). This typically means there were other warps available and this one simply waited its turn. It is not a dependency stall. It usually indicates that other ready warps were chosen to issue that cycle, which is expected at healthy occupancy. | Usually not a problem—it means the GPU had other work to do and chose a different warp for that cycle. If you see a high percentage of “Not Selected,” it implies high occupancy is doing its job (hiding latency). No action needed unless it indicates an imbalance (one warp hogging the scheduler; in rare cases, you might use scheduler hints or yield). |
+
+| Warp 停顿原因 | 含义/成因 | 潜在优化 |
+| --- | --- | --- |
+| Execution dependency | warp 因一条先前的、被依赖的指令而停顿。这通常表明线程内指令级并行（ILP）不足。 | 提升 ILP（在同一线程内做相互独立的工作）。展开循环或重排指令，让长延迟操作（如乘法或复杂数学运算）有其他工作可以与之重叠。如果 ILP 已经用满却仍在停顿，就依靠更多的 warp（占用率）来隐藏延迟。 |
+| Memory dependency（Long Scoreboard 停顿） | warp 正在等待内存加载（“长延迟”）完成才能继续。在数据到达之前，warp 中没有其他工作可以推进。 | 通过让更多 warp 处于就绪状态、即提高占用率来隐藏内存延迟，从而在该 warp 等待时其他 warp 可以运行。或者使用异步内存预取把数据拷贝到共享内存，然后继续计算。这会让内存操作与计算重叠。要把延迟降到最低，请确保内存访问高效、使用恰当的合并访问，并善用合适的缓存层级。在现代 GPU 上，应当使用 Tensor Memory Accelerator（TMA）进行批量的多维拷贝，从而以较低的线程开销让内存搬运与计算重叠。 |
+| Synchronization（barrier） | warp 正在 __syncthreads() 或其他同步处等待，在所有线程到达屏障之前处于空闲。往往表明要么同步过于频繁，要么负载不均衡（某些 warp 先到达并等待）。 | 减少不必要的同步。重新审视算法，寻找合并各阶段或使用细粒度同步的办法。确保工作均匀分布，使各 warp 大致同时到达屏障。在某些情况下，使用较新的同步原语（例如 warp 级同步或 cluster 同步）来限制同步的作用范围。 |
+| Instruction fetch/issue | warp 因等待取下一条指令而停顿（可能是指令缓存未命中或流水线问题），或者因所需的执行流水线繁忙而未被发射。这在非常大的核函数或某些流水线争用场景下可能发生。 | 如果指令缓存未命中是个问题，考虑缩小核函数规模（拆分核函数，或避免过度展开导致代码体积膨胀）。如果是流水线发射问题（某一类型指令使某个功能单元饱和），尝试混合指令类型，或再次利用 ILP 来占用不同的流水线。 |
+| Not selected（scheduler） | warp 已就绪，但在该周期未被选中发射（调度器选了另一个 warp）。这通常意味着还有其他可用的 warp，而这个只是在等待轮到它。它并不是依赖性停顿。它通常表明该周期选择了其他就绪的 warp 来发射，这在健康的占用率下是意料之中的。 | 通常不是问题——它意味着 GPU 还有其他工作可做，并在该周期选择了另一个 warp。如果你看到“Not Selected”占比很高，说明高占用率正在发挥作用（隐藏延迟）。除非它表明存在不均衡（某个 warp 霸占调度器；在极少数情况下，你或许可以使用调度器提示或让出），否则无需采取任何行动。 |
+
+By interpreting these stall reasons, you can decide which optimization to pursue. For example, high memory stall time means you should try to hide latency with more warps, better memory access patterns, or asynchronous prefetch.
+
+通过解读这些停顿原因，你就能决定该追求哪种优化。例如，内存停顿时间高意味着你应当尝试用更多的 warp、更好的内存访问模式或异步预取来隐藏延迟。
+
+Seeing high execution dependency stalls suggests that you should increase ILP or rearrange code. Frequent barrier stalls mean you should likely rework synchronization. This profiling step guides you to the most effective optimizations rather than blindly tuning everything.
+
+看到执行依赖停顿高，提示你应当提升 ILP 或重排代码。频繁的屏障停顿意味着你很可能应当重构同步。这一剖析步骤会引导你走向最有效的优化，而不是盲目地对一切进行调优。
+
+## Inspecting Achieved Occupancy and GPU Utilization
+
+## 检查实测占用率与 GPU 利用率
+
+Another key metric reported by profilers is *achieved occupancy*, or the average fraction of hardware thread slots, warps, that were occupied on each SM during execution. For example, if a GPU supports 64 warps per streaming multiprocessor (SM) and achieved occupancy is 30%, then on average 19 warps were active per SM.
+
+剖析器报告的另一个关键指标是 *实测占用率*，即执行期间每个 SM 上被占用的硬件线程槽（即 warp）的平均比例。举例来说，如果一个 GPU 每个流多处理器（streaming multiprocessor，SM）支持 64 个 warp，而实测占用率为 30%，那么平均每个 SM 上有 19 个 warp 处于活跃状态。
+
+Low achieved occupancy often signals underutilization since you can’t hide enough latency with only a few active warps. On the other hand, if you’re running at near-maximum occupancy, but still not seeing the expected performance benefits, other bottlenecks are likely the cause. These include memory bandwidth limitations, inefficient instruction streams, and suboptimal memory-access patterns.
+
+实测占用率偏低往往预示着利用不足，因为仅靠少数活跃的 warp 无法隐藏足够的延迟。另一方面，如果你运行在接近最大占用率，却仍看不到预期的性能收益，那么原因很可能是其他瓶颈。这些瓶颈包括内存带宽限制、低效的指令流，以及次优的内存访问模式。
+
+In these nonideal cases, simply adding more threads won’t help. Instead, you should investigate to improve memory coalescing, increase arithmetic intensity, and optimize warp‐level efficiency. We’ll cover these techniques in the upcoming sections.
+
+在这些非理想的情况下，单纯增加更多线程无济于事。相反，你应当着手改善内存合并、提高算术强度，并优化 warp 级效率。我们会在接下来的几节中介绍这些技术。
+
+Nsight Compute also reports occupancy limiters, including which resource is constraining the theoretical occupancy. For example, “Limited by max registers per thread” means your kernel’s register usage is preventing more warps from being scheduled per SM.
+
+Nsight Compute 还会报告占用率限制项，包括是哪种资源在约束理论占用率。例如，“Limited by max registers per thread”意味着你核函数的寄存器用量阻止了每个 SM 调度更多的 warp。
+
+However, “Limited by shared memory per block” means the kernel’s shared memory allocation per block is the bottleneck for occupancy. And “Limited by thread count” means the launch configuration itself, grid, or block size didn’t request enough threads to fill the GPU.
+
+而“Limited by shared memory per block”意味着核函数每个 block 的共享内存分配是占用率的瓶颈。“Limited by thread count”则意味着启动配置本身（网格或线程块大小）请求的线程不足以填满 GPU。
+
+Each of these limiters hints at different fixes, which we will discuss in more detail in the next section. For instance, if registers are the limiter, you might reduce register usage or use __launch_bounds__ to allow more blocks. If shared memory is the limiter, you can try to use smaller tiles and less shared memory per block.
+
+这些限制项各自提示了不同的修复方向，我们会在下一节更详细地讨论。例如，如果寄存器是限制项，你也许可以减少寄存器用量，或使用 __launch_bounds__ 以允许更多的 block。如果共享内存是限制项，你可以尝试使用更小的分块，减少每个 block 的共享内存。
+
+Beyond a certain point, increasing occupancy may not produce a speedup. Very low occupancy (e.g., 10%–20%) will hurt performance due to poor latency hiding. On the other hand, pushing occupancy to 100% isn’t always beneficial if other factors like memory bandwidth and instruction dependencies become the bottleneck.
+
+超过某个临界点后，提高占用率未必带来加速。非常低的占用率（例如 10%–20%）会因延迟隐藏不佳而损害性能。另一方面，如果内存带宽和指令依赖等其他因素成为瓶颈，把占用率推到 100% 也并不总是有益。
+
+As such, you should examine hardware utilization beyond just occupancy. Nsight Compute reports metrics such as achieved memory bandwidth in GB/s, achieved FLOPS in TFLOPS, instructions per cycle (IPC), issue-slot utilization, and other resource utilization statistics. These numbers will show how close your kernel is to the GPU’s physical hardware limits.
+
+因此，你应当审视占用率以外的硬件利用情况。Nsight Compute 会报告诸如以 GB/s 表示的实测内存带宽、以 TFLOPS 表示的实测 FLOPS、每周期指令数（IPC）、发射槽利用率，以及其他资源利用统计。这些数字会显示你的核函数距离 GPU 的物理硬件极限还有多近。
+
+For example, if your kernel’s ALU utilization is low while its memory throughput is at 95% of peak, you are almost certainly memory-bandwidth bound. Conversely, if ALU utilization is near its maximum but memory throughput remains modest, the kernel is compute bound. In this case, you’ll gain speed only by increasing arithmetic throughput—typically by switching to lower-precision types (FP16, FP8, or FP4) and moving work onto the faster Tensor Cores of the GPUs.
+
+例如，如果你核函数的 ALU 利用率偏低，而其内存吞吐处于峰值的 95%，那你几乎可以肯定是内存带宽受限。反过来，如果 ALU 利用率接近其最大值而内存吞吐仍然一般，那么核函数是计算受限的。在这种情况下，你只有通过提高算术吞吐才能获得速度提升——通常是切换到较低精度类型（FP16、FP8 或 FP4），并把工作转移到 GPU 更快的 Tensor Core 上。
+
+If both ALU utilization and memory throughput are low, your kernel may be experiencing long-latency operations, synchronization overhead, or simply insufficient parallel work. This could indicate low *instruction-level parallelism* (discussed in an upcoming section)—or that you haven’t launched enough threads to fully utilize the GPU.
+
+如果 ALU 利用率和内存吞吐都很低，你的核函数可能正遭遇长延迟操作、同步开销，或干脆是并行工作不足。这可能表明 *指令级并行* 偏低（将在后续小节讨论），或者你启动的线程不足以充分利用 GPU。
+
+You can frame this analysis using the Roofline model, which plots a kernel’s FLOPS against its arithmetic intensity (FLOPS per byte of memory accessed). The roofline defines a *compute roof* (the maximum FLOPS the GPU can sustain) and a *memory roof* (the maximum memory bandwidth).
+
+你可以用 Roofline 模型来框定这一分析，它把核函数的 FLOPS 对照其算术强度（每访问一字节内存所做的 FLOPS）来绘制。屋顶线定义了一个 *计算屋顶*（GPU 能持续维持的最大 FLOPS）和一个 *内存屋顶*（最大内存带宽）。
+
+If your kernel’s FLOP/byte ratio falls below the hardware’s compute-to-memory ratio, you are memory bound because you cannot supply data fast enough. If the ratio is high but actual FLOPS remains far below peak, the kernel may be latency bound or lacking sufficient ILP to saturate the compute units.
+
+如果你核函数的 FLOP/byte 比率落在硬件的计算与内存比率之下，你就是访存受限，因为你无法足够快地供给数据。如果该比率很高但实际 FLOPS 仍远低于峰值，那么核函数可能是延迟受限，或者缺乏足够的 ILP 来让计算单元饱和。
+
+> With each new GPU generation, memory bandwidth increases modestly, but compute capacity grows much faster. As such, kernels tend to become more memory bound over time.
+
+> 每一代新 GPU，内存带宽只是适度增长，但计算能力增长得快得多。因此，随着时间推移，核函数往往变得越来越访存受限。
+
+In practice, always compare two key figures: your kernel’s memory throughput versus the hardware’s peak memory bandwidth—as well as your kernel’s compute throughput versus the hardware’s peak FLOPS. Those comparisons will tell you whether your next optimization should focus on memory access, compute work, or parallelism. Let’s look at each of these next.
+
+在实践中，始终对比两组关键数字：你核函数的内存吞吐相对硬件的峰值内存带宽，以及你核函数的计算吞吐相对硬件的峰值 FLOPS。这些对比会告诉你，下一步优化应当聚焦于内存访问、计算工作，还是并行度。接下来我们逐一来看。
+
+### Kernel Memory Throughput Versus Peak HBM Memory Bandwidth
+
+### 核函数内存吞吐相对 HBM 峰值内存带宽
+
+Nsight Compute reports how many GB/s your kernel achieves. If your kernel is showing near-peak memory bandwidth utilization, performing more computations won’t help. You would have to increase arithmetic intensity by reducing memory traffic per operation.
+
+Nsight Compute 会报告你的核函数实现了多少 GB/s。如果你的核函数显示出接近峰值的内存带宽利用率，那么执行更多计算也无济于事。你将不得不通过减少每次操作的内存流量来提高算术强度。
+
+You can increase arithmetic intensity by using reduced precision with Tensor Cores, hiding more latency with concurrency, and using kernel fusion, which we’ll cover in a bit. These techniques help reduce global memory traffic by decreasing the size of intermediate data that is being transferred.
+
+你可以通过配合 Tensor Core 使用降低精度、用并发隐藏更多延迟，以及使用核函数融合（稍后会介绍）来提高算术强度。这些技术通过减小被传输的中间数据的规模，从而帮助降低全局内存流量。
+
+For instance, if a kernel hits ~80% or more of the GPU’s memory bandwidth, it’s likely memory bound since there is little headroom left.
+
+举例来说，如果一个核函数达到 GPU 内存带宽的约 80% 或更高，它很可能是访存受限的，因为几乎没有余量了。
+
+However, note that Blackwell GPUs have a relatively large 126 MB L2 cache. And their dual-die design uses a high-bandwidth 10 TB/s interconnect, NVIDIA High-Bandwidth Interface (NV-HBI), so the two GPU dies behave as one for memory access. As such, many kernels that were previously memory bound on older GPUs might better utilize the cache with newer GPU generations.
+
+不过要注意，Blackwell GPU 拥有相对较大的 126 MB L2 缓存。而且它们的双裸片设计使用了高带宽的 10 TB/s 互连——NVIDIA High-Bandwidth Interface（NV-HBI），因此两个 GPU 裸片在内存访问上表现得如同一个。因此，许多在旧款 GPU 上先前属于访存受限的核函数，在更新一代 GPU 上或许能更好地利用缓存。
+
+You can use Nsight Compute’s memory chart to see how much traffic goes to L2 versus DRAM. A high L2 hit rate could alleviate global memory bottlenecks, which means the kernel might actually be compute-limited despite performing heavy memory accesses. The on-chip cache is servicing a lot of the memory accesses.
+
+你可以使用 Nsight Compute 的内存图表来查看有多少流量流向 L2、多少流向 DRAM。较高的 L2 命中率可以缓解全局内存瓶颈，这意味着尽管核函数执行了大量内存访问，它实际上可能是计算受限的。片上缓存正在服务大量的内存访问。
+
+> On Blackwell, you can control L2 data persistence to keep critical working sets resident.
+
+> 在 Blackwell 上，你可以控制 L2 数据的持久性，以让关键的工作集常驻。
+
+### Kernel Compute Throughput Versus Peak GPU FLOPS
+
+### 核函数计算吞吐相对 GPU 峰值 FLOPS
+
+Low achieved FLOPS can be caused by low occupancy or instruction-level stalls. For example, if only 30% of warps are active on average—or if pipelines are often idle due to memory waits—the kernel will sit far below the compute roof. You can use Nsight Compute’s Occupancy section and Source Counters to pinpoint these issues. Ensure the kernel launches enough threads to fill the GPU, up to the per-SM resident warps limit for your device (e.g., 64 resident warps per SM.)
+
+实测 FLOPS 偏低可能由占用率偏低或指令级停顿引起。例如，如果平均只有 30% 的 warp 处于活跃状态，或者流水线因内存等待而经常空闲，核函数就会远远低于计算屋顶。你可以使用 Nsight Compute 的 Occupancy 区段和 Source Counters 来精准定位这些问题。确保核函数启动足够多的线程来填满 GPU，直至你设备每个 SM 的驻留 warp 上限（例如每个 SM 64 个驻留 warp）。
+
+> Only warps within the same SM must share resources—and they can hide one another’s latency. Warps on different SMs have no interaction. As such, achieved occupancy is measured per SM. We’ll cover occupancy in a bit.
+
+> 只有同一个 SM 内的 warp 才必须共享资源，而且它们可以互相隐藏对方的延迟。不同 SM 上的 warp 之间没有交互。因此，实测占用率是按每个 SM 来度量的。我们稍后会介绍占用率。
+
+Additionally, examine instruction issue efficiency and throughput metrics. Blackwell scales to many SMs per device, so underutilization at the kernel level can translate to large aggregate losses. (Note: The dual-die packaging does not, by itself, increase the per-SM issue rate.)
+
+此外，还要检查指令发射效率与吞吐指标。Blackwell 每个设备扩展到大量 SM，因此核函数层面的利用不足可能转化为巨大的总体损失。（注：双裸片封装本身并不会提升每个 SM 的发射速率。）
+
+If the achieved FLOPS are moderate to high but memory throughput is low, the kernel might be mostly compute-focused but limited by instruction dependencies. You can confirm by checking the “Exec Dependency” stalls metric in Nsight Compute—and any other stall reasons.
+
+如果实测 FLOPS 处于中到高水平但内存吞吐偏低，核函数可能主要以计算为主，但受限于指令依赖。你可以通过检查 Nsight Compute 中的“Exec Dependency”停顿指标以及任何其他停顿原因来加以确认。
+
+If compute throughput is near peak, then you are truly compute bound. In this case, you have already optimized the kernel’s memory access patterns—or you are already using lower-precision Tensor Cores to reach such high FLOPS.
+
+如果计算吞吐接近峰值，那你就是真正的计算受限了。在这种情况下，你已经优化了核函数的内存访问模式，或者你已经在使用较低精度的 Tensor Core 来达到如此高的 FLOPS。
+
+Prolonged near-peak compute utilization can sometimes invoke power management compute limiters on modern GPUs to keep them healthy. Be sure to take this into account when you’re profiling, benchmarking, and tuning. The easiest way to see if you’re being power-limited is to use the following to monitor the enforced power limit alongside any “HW Slowdown” flags in real time:
+
+长时间接近峰值的计算利用率，有时会在现代 GPU 上触发功耗管理的计算限制器，以保持 GPU 健康运行。在剖析、基准测试和调优时，务必把这一点考虑进去。判断你是否被功耗限制，最简单的办法是使用下面的命令，实时监控被强制执行的功耗上限以及任何“HW Slowdown”标志：
+
+```
+nvidia-smi \
+  --query-gpu=\
+  power.draw,clocks.current.sm,clocks.current.memory,\
+  clocks_event_reasons.active \
+  --format=csv -l 1
+```
+
+```
+nvidia-smi \
+  --query-gpu=\
+  power.draw,clocks.current.sm,clocks.current.memory,\
+  clocks_event_reasons.active \
+  --format=csv -l 1
+```
+
+This command prints a new line every 1 second with current power draw, graphics/memory clocks, and throttle reasons. With this information you can pinpoint when the GPU hits its power cap and downclocks.
+
+这条命令每 1 秒打印一行，包含当前功耗、图形/内存时钟以及降频原因。有了这些信息，你就能精准定位 GPU 何时触及功耗上限并降频。
+
+You can also use NVIDIA’s Management Library (NVML) API, which provides programmatic access to the CUDA C++ nvmlDeviceGetPowerUsage() and nvmlDevice GetEnforcedPowerLimit() APIs—as well as the equivalent NVML Python APIs. These are ideal for custom scripts or integration with monitoring systems.
+
+你还可以使用 NVIDIA 的 Management Library（NVML）API，它提供对 CUDA C++ 的 nvmlDeviceGetPowerUsage() 和 nvmlDeviceGetEnforcedPowerLimit() API 的编程访问，以及等价的 NVML Python API。这些非常适合用于自定义脚本或与监控系统集成。
+
+In short, use a combination of occupancy, warp stall reasons, memory throughput, and compute throughput metrics together to diagnose the bottleneck. Make sure you see high occupancy, high warp efficiency, and a balanced usage of execution units, including Tensor Cores.
+
+简而言之，把占用率、warp 停顿原因、内存吞吐和计算吞吐这些指标结合起来共同诊断瓶颈。确保你看到的是高占用率、高 warp 效率，以及执行单元（包括 Tensor Core）的均衡使用。
+
+### Iteratively Profiling and Determining the Kernel Bottleneck
+
+### 迭代式剖析并确定核函数瓶颈
+
+GPUs can stall for four fundamentally different reasons: underutilization, latency bound, memory bound, and compute bound. These regimes are related, but it’s important to understand each of them independently in order to choose the right optimizations to pursue. Often, fixing one bottleneck will reveal another.
+
+GPU 停顿有四种根本不同的原因：利用不足、延迟受限、访存受限和计算受限。这些区间彼此相关，但为了选择正确的优化方向，独立理解它们中的每一个都很重要。往往，修复一个瓶颈会暴露出另一个。
+
+Underutilization happens when you simply haven’t launched enough threads or work. In this case, both FLOPS and memory bandwidth stay low and the execution timeline has idle gaps. Once you increase parallelism, you will find your warps are now stalling and waiting on memory loads.
+
+当你只是没有启动足够的线程或工作量时，就会发生利用不足。在这种情况下，FLOPS 和内存带宽都保持在低位，执行时间线上存在空闲间隙。一旦你提高了并行度，你就会发现你的 warp 现在开始停顿并等待内存加载了。
+
+Once you more fully utilize your GPU, you can now distinguish between latency bound and memory bound. A latency-bound kernel issues far fewer bytes/sec than the hardware can deliver because individual memory loads are stalling the warps. The fix is to increase memory-compute overlap by increasing occupancy, using more ILP, prefetching, and pipelining.
+
+在你更充分地利用 GPU 之后，你现在就能区分延迟受限与访存受限了。一个延迟受限的核函数每秒发出的字节数远少于硬件能够交付的量，因为单次内存加载正在让 warp 停顿。修复办法是通过提高占用率、使用更多 ILP、预取和流水线化，来增加内存与计算的重叠。
+
+A memory-bound kernel, in contrast, is saturating DRAM bandwidth, but your ALUs are sitting idle, not because of stalls but because there’s simply no more data you can fetch per second due to the memory pipe saturation. In this case, you must raise arithmetic intensity with tiling, fusing, exploiting caches (L1/texture), or reducing precision to reduce memory traffic.
+
+相比之下，一个访存受限的核函数正在使 DRAM 带宽饱和，但你的 ALU 却处于空闲——并非因为停顿，而是由于内存流水线饱和，你每秒根本无法再取到更多数据。在这种情况下，你必须通过分块、融合、利用缓存（L1/纹理）或降低精度来减少内存流量，从而提高算术强度。
+
+If neither of those fixes produces more speed, you’ve moved into compute-bound territory in which the GPU’s arithmetic pipes (e.g., ALUs and Tensor Cores) are the limiting factor. Here you can increase per-thread ILP by overlapping independent instructions with unrolling and software pipelining. On modern GPUs, unified cores cannot execute an INT32 and an FP32 instruction in the same clock. In other words, mixed INT32 and FP32 workloads do not execute both types from the same core in the same cycle. As such, the achievable issue rate depends on your instruction mix.
+
+如果上述这些修复都不能带来更多加速，你就进入了计算受限的领域，此时 GPU 的算术流水线（例如 ALU 和 Tensor Core）成为限制因素。在这里，你可以通过用循环展开和软件流水线把相互独立的指令重叠起来，以提高每线程的 ILP。在现代 GPU 上，统一核心无法在同一个时钟周期内执行一条 INT32 指令和一条 FP32 指令。换句话说，混合的 INT32 与 FP32 工作负载不会在同一周期内由同一个核心同时执行这两种类型。因此，可实现的发射速率取决于你的指令构成。
+
+As you optimize, you’ll often find yourself working through these regimes as follows: underutilized → latency bound → memory bound → compute bound. After each fix, you will likely hit a new bottleneck and apply the corresponding strategy. When optimizing GPU code, you should follow a structured approach as described here.
+
+在优化过程中，你往往会发现自己按如下顺序穿行于这些区间：利用不足 → 延迟受限 → 访存受限 → 计算受限。每次修复之后，你很可能会撞上一个新的瓶颈，并施加相应的策略。在优化 GPU 代码时，你应当遵循这里所述的结构化方法。
+
+First, you should profile. Next, you can identify the bottleneck. You can use Nsight Compute for kernel-level metrics (e.g., warp stalls, achieved occupancy, memory versus compute utilization) and Nsight Systems for application-level timelines (e.g., concurrency, idle gaps). Once you identify the bottlenecks, you can determine if the kernel is memory bound, compute bound, latency bound, or simply underutilizing the GPU. The GPU is underutilized when it is not issuing enough work. Table 8-2 summarizes these four regimes, including common profiling indicators and remedies.
+
+首先，你应当剖析。接下来，你可以识别瓶颈。你可以用 Nsight Compute 获取核函数级指标（例如 warp 停顿、实测占用率、内存与计算利用率），用 Nsight Systems 获取应用级时间线（例如并发、空闲间隙）。一旦识别出瓶颈，你就能判断核函数是访存受限、计算受限、延迟受限，还是仅仅是 GPU 利用不足。当 GPU 没有发出足够的工作时，它就处于利用不足的状态。表 8-2 总结了这四种区间，包括常见的剖析指标和补救措施。
+
+Table 8-2. Memory bound versus latency bound versus compute bound versus underutilizing the GPU
+
+表 8-2. 访存受限、延迟受限、计算受限与 GPU 利用不足的对比
+
+| Limiting factor | Description | Profiler indicators | Remedies |
+| --- | --- | --- | --- |
+| Memory bound | You’re moving as much data as you can—close to peak DRAM bandwidth—but you don’t have enough work per byte to fully utilize the ALUs. | High memory-bandwidth utilization is near peak, low FLOPS. | Increase arithmetic intensity (e.g., tiling, fusion) and improve coalescing and caching. |
+| Compute bound | You’ve hidden memory latency and are no longer saturating memory bandwidth. Now the ALUs (e.g., CUDA cores and Tensor Cores) are the bottleneck. | High FLOPS are approaching GPU peak, low memory utilization. | Exploit more ILP (e.g., dual-issue, loop unroll), use specialized units (e.g., FP16/FP8/FP4/Tensor Cores), reduce dependencies, fuse work, leverage lower precision or sparsity. |
+| Latency bound | You’re not sustaining enough concurrent work to hide individual load/store latencies, so warps stall waiting on data. | Low achieved bandwidth well below peak, high “stall-on-scoreboard” or “not selected” percentages. | Raise occupancy, add ILP (e.g., unroll, multiple accumulators), intra-kernel pipelining, and software prefetch. |
+| Underutilizing the GPU | You’re not fully occupying SMs or launching enough work—both memory and compute resources remain idle. | Low occupancy and low achieved bandwidth, low FLOPS, timeline shows gaps or sparse kernel activity. | Increase problem size or batch work, launch more threads/blocks, fuse tasks, use persistent kernels (Chapter 10) or streams (Chapter 11). |
+
+| 限制因素 | 描述 | 剖析器指标 | 补救措施 |
+| --- | --- | --- | --- |
+| Memory bound（访存受限） | 你已经在尽可能多地搬运数据——接近 DRAM 峰值带宽——但每字节对应的运算量不足，无法充分利用 ALU。 | 内存带宽利用率接近峰值，FLOPS 偏低。 | 提高算术强度（例如 tiling、融合），并改善合并访问与缓存。 |
+| Compute bound（计算受限） | 你已经隐藏了内存延迟，不再让内存带宽饱和。此时 ALU（例如 CUDA 核心与 Tensor Core）成为瓶颈。 | FLOPS 高、接近 GPU 峰值，内存利用率低。 | 挖掘更多 ILP（例如 dual-issue、循环展开），使用专用单元（例如 FP16/FP8/FP4/Tensor Core），减少依赖，融合工作，利用更低精度或稀疏性。 |
+| Latency bound（延迟受限） | 你没有维持足够的并发工作来隐藏单次 load/store 的延迟，于是 warp 停顿等待数据。 | 实测带宽远低于峰值，“stall-on-scoreboard”或“not selected”的百分比很高。 | 提高占用率，增加 ILP（例如展开、多累加器），核内流水线化，以及软件预取。 |
+| Underutilizing the GPU（GPU 利用不足） | 你没有充分占满 SM 或没有启动足够的工作——内存与计算资源都处于空闲状态。 | 占用率低、实测带宽低、FLOPS 低，时间线上出现空隙或稀疏的核函数活动。 | 增大问题规模或做批处理，启动更多线程/线程块，融合任务，使用持久化核函数（Chapter 10）或流（Chapter 11）。 |
+
+A memory-bound kernel is one where performance is limited by memory throughput—specifically, if the GPU’s global memory is unable to feed data to the compute units fast enough. In this case, your kernel’s achieved FLOPS will sit near the roofline set by memory bandwidth. This happens if you have plenty of threads but can’t move data any faster. As such, you’re up against the memory-bandwidth ceiling.
+
+访存受限的核函数是指其性能受内存吞吐限制——具体来说，就是 GPU 的全局内存无法足够快地把数据喂给计算单元。这种情况下，你的核函数实测 FLOPS 会停留在内存带宽所决定的屋顶线附近。当你拥有大量线程却无法把数据搬得更快时，就会出现这种情况。这样一来，你就撞上了内存带宽的天花板。
+
+Conversely, a compute-bound kernel saturates the GPU’s arithmetic units (ALU FP32 CUDA cores or reduced-precision Tensor Cores). This is noticeable if the kernel is approaching the peak FLOPS roofline for the cores. Profiling metrics like achieved occupancy, memory utilization, and execution dependency stalls can help confirm this classification.
+
+反过来，计算受限的核函数会让 GPU 的算术单元（ALU FP32 CUDA 核心或降精度的 Tensor Core）饱和。如果核函数正逼近这些核心的峰值 FLOPS 屋顶线，就能察觉到这一点。诸如实测占用率（achieved occupancy）、内存利用率和执行依赖停顿等剖析指标，有助于确认这一分类。
+
+When a kernel is latency bound, on the other hand, each thread spends a large fraction of its time waiting on individual memory loads instead of doing useful work. In practical terms, this means that when a warp issues a global‐memory load to fetch A[idx], for instance, all 32 threads in that warp will stall until that fetch completes. If the code immediately issues another dependent load or computation, the warp simply sits idle for hundreds of cycles on each load.
+
+另一方面，当核函数是延迟受限时，每个线程都有很大一部分时间在等待单次的内存 load，而不是在做有用的工作。实际来说，这意味着当一个 warp 发出一条全局内存 load（例如去取 A[idx]）时，该 warp 中全部 32 个线程都会停顿，直到这次取数完成。如果代码紧接着又发出另一条依赖的 load 或计算，那么该 warp 在每次 load 上都会白白空闲数百个周期。
+
+The GPU’s warp scheduler may switch to other warps when it is latency bound, but if every warp is structured the same way (e.g., one load → wait → compute → write), there is rarely any other work to fill in those idle cycles. As such, the kernel never has enough independent operations in flight to hide the latency of a long‐latency DRAM access.
+
+当 GPU 处于延迟受限时，其 warp 调度器可以切换到其他 warp，但如果每个 warp 的结构都相同（例如一次 load → 等待 → 计算 → 写回），那就几乎没有其他工作可以填补这些空闲周期。这样一来，核函数始终没有足够多的独立操作在途（in-flight），无法隐藏一次长延迟 DRAM 访问的延迟。
+
+To break out of the latency‐bound situation, you need to give the GPU multiple operations to overlap. One approach is to increase occupancy by launching more threads and warps. This way, when one warp stalls on its load, another warp is ready to run.
+
+要摆脱延迟受限的局面，你需要给 GPU 提供多个可以相互重叠的操作。一种方法是通过启动更多线程和 warp 来提高占用率。这样，当一个 warp 在其 load 上停顿时，另一个 warp 已经准备好运行。
+
+Equally important, though, is increasing each warp’s ILP. We’ll cover ILP in more detail later in this chapter. At a high level, if each thread issues two or more independent loads back‐to‐back by loading A[idx] and B[idx] before doing any arithmetic, the GPU can start overlapping those loads in hardware.
+
+不过同样重要的是提高每个 warp 的 ILP。我们会在本章后面更详细地讨论 ILP。从宏观上说，如果每个线程在做任何算术之前，都背靠背地发出两条或更多相互独立的 load（即先加载 A[idx] 和 B[idx]），GPU 就能在硬件层面开始让这些 load 相互重叠。
+
+In this case, while the first load waits for DRAM, load two (and three and four, etc.) can already be in flight. As soon as any of these loads return, the dependent arithmetic can execute. This will further overlap with the remaining pending loads.
+
+在这种情况下，当第一条 load 在等待 DRAM 时，第二条（以及第三条、第四条等）load 已经可以在途。只要其中任何一条 load 返回，依赖它的算术就可以执行。而这又会进一步与仍在等待的其余 load 重叠。
+
+> You can also increase ILP by unrolling a small loop so that multiple values are fetched before any computation. More on this later.
+
+> 你还可以通过展开一个小循环来提高 ILP，从而在任何计算之前就取回多个值。稍后会详细讨论这一点。
+
+By increasing ILP, each thread and warp always has enough work in flight so that the DRAM latency is masked by other outstanding operations. The net effect is to transform a latency‐bound kernel into one that keeps the SM’s pipelines busy. This will increase throughput and overall kernel performance.
+
+通过提高 ILP，每个线程和 warp 始终都有足够的工作在途，使得 DRAM 延迟被其他未完成的操作所掩盖。其净效果是把一个延迟受限的核函数转变为让 SM 流水线保持繁忙的核函数。这会提高吞吐（throughput）和整体核函数性能。
+
+When the GPU is underutilized, you’re not launching enough work to keep SMs and memory pipelines busy, so many resources remain idle. In this case, it will help to increase the amount of work by increasing the batch size or launching more threads.
+
+当 GPU 利用不足时，你没有启动足够的工作来让 SM 和内存流水线保持繁忙，于是许多资源处于空闲状态。这种情况下，通过增大批大小或启动更多线程来增加工作量会有帮助。
+
+### Optimizing the Kernel
+
+### 优化核函数
+
+In practice, performance tuning should follow a clear, step‐by‐step workflow. First, identify which regime your kernel occupies: memory bound, latency bound, compute bound, or underutilized. Next, apply the corresponding optimizations.
+
+在实践中，性能调优应遵循一个清晰的、按部就班的工作流。首先，判断你的核函数属于哪个区间：访存受限、延迟受限、计算受限还是利用不足。接着，施加相应的优化。
+
+If your kernel is memory bound, concentrate on reducing and hiding memory traffic. You can do this by improving coalescing, raising occupancy, increasing ILP, and introducing data reuse through caching or tiling. When the kernel is latency bound, meaning individual load or instruction latencies dominate, make sure there is enough independent work in flight. You can do this by issuing multiple nondependent loads/operations per thread or increasing overall occupancy so the scheduler always has ready warps to run.
+
+如果核函数是访存受限，就把精力集中在减少并隐藏内存流量上。你可以通过改善合并访问、提高占用率、增加 ILP，以及借助缓存或 tiling 引入数据复用来做到这一点。当核函数是延迟受限时（意味着单次 load 或指令的延迟占主导），要确保有足够的独立工作在途。你可以通过让每个线程发出多条互不依赖的 load/操作，或提高整体占用率，使调度器始终有就绪的 warp 可运行来做到这一点。
+
+If the kernel is compute‐bound (i.e., the ALUs or Tensor Cores are saturated while memory is idle), shifting to lower‐precision arithmetic (FP16/FP8/FP4), offloading work onto Tensor Cores, or fusing more operations together can raise arithmetic throughput. Finally, if the GPU appears underutilized with low occupancy and frequent idle cycles, simply launching more threads or blocks (so that all SMs have work) is often enough to get the hardware busy before applying deeper optimizations.
+
+如果核函数是计算受限（即 ALU 或 Tensor Core 饱和而内存空闲），那么转向更低精度的算术（FP16/FP8/FP4）、把工作卸载到 Tensor Core 上，或融合更多操作，都可以提高算术吞吐。最后，如果 GPU 看起来利用不足，表现为占用率低且频繁出现空闲周期，那么在施加更深入的优化之前，往往只需简单地启动更多线程或线程块（让所有 SM 都有工作）就足以让硬件忙起来。
+
+Here is a list of high-level optimization techniques that help you treat GPU performance tuning as a scientific process. We’ll dive into these over the next few chapters, but they should each include identifying the limiting factor, applying the appropriate optimization, and measuring the outcome:
+
+下面列出一些高层次的优化技术，帮助你把 GPU 性能调优当作一个科学过程来对待。我们会在接下来的几章深入探讨这些技术，但它们都应包含：识别限制因素、施加恰当的优化、度量结果：
+
+*Convert memory-bound workloads to compute bound* If memory bound (low arithmetic intensity), increase data reuse and work per launch as follows: apply tiling to use fast shared memory and reduce redundant accesses, fuse kernels to avoid unnecessary memory round trips, ensure memory accesses are optimized (coalesced, avoiding bank conflicts as per Chapter 6), and consider using compression or lower precision to move less data.
+
+*将访存受限的工作负载转化为计算受限* 如果是访存受限（算术强度低），就按如下方式增加数据复用和每次启动的工作量：应用 tiling 以使用快速的共享内存并减少冗余访问，融合核函数以避免不必要的内存往返，确保内存访问已优化（合并访问，按 Chapter 6 所述避免 bank 冲突），并考虑使用压缩或更低精度以搬运更少的数据。
+
+*Further optimize compute-bound workloads* If compute bound (e.g., high utilization of ALUs but not hitting peak due to dependencies), increase effective instruction throughput as follows: use ILP techniques (e.g., unroll loops, multiple accumulators to overlap independent ops), check for branch divergence (see Chapter 6) and try to reorganize work to reduce it since divergence wastes ALU cycles, and move to Tensor Cores and lower precision to raise the compute ceiling. If the kernel is at compute roof, see if reducing precision (FP32 → FP16 → FP8 → FP4) can give further speedups.
+
+*进一步优化计算受限的工作负载* 如果是计算受限（例如 ALU 利用率高但因依赖关系而未达峰值），就按如下方式提高有效指令吞吐：使用 ILP 技术（例如展开循环、用多累加器重叠独立操作），检查分支分歧（见 Chapter 6）并尝试重组工作以减少分歧，因为分歧会浪费 ALU 周期，以及转向 Tensor Core 和更低精度以提升计算天花板。如果核函数已处于计算屋顶（compute roof），可以看看降低精度（FP32 → FP16 → FP8 → FP4）能否带来进一步加速。
+
+*Increase parallelism for latency-bound workloads* If latency bound (e.g., frequent warp stalls and not enough parallelism to hide latency), increase concurrency at various levels as follows: launch more threads/blocks if possible until latency is hidden, ensure registers/shared memory are not overly limiting occupancy (e.g., occupancy tuning and balancing resource usage), overlap memory and compute within each thread/warp using async copies (e.g., intra-kernel pipelining), and use multiple streams to overlap independent tasks or overlap copies with compute (e.g., inter-kernel concurrency described in Chapter 11). If launch overhead is an issue (e.g., many tiny kernels), consider merging them with cooperative groups or simply combining their code (e.g., kernel fusion).
+
+*为延迟受限的工作负载增加并行度* 如果是延迟受限（例如 warp 频繁停顿且并行度不足以隐藏延迟），就按如下方式在各个层面增加并发：在可能的情况下启动更多线程/线程块，直到延迟被隐藏；确保寄存器/共享内存不会过度限制占用率（例如占用率调优与平衡资源使用）；在每个线程/warp 内使用异步拷贝重叠内存与计算（例如核内流水线化）；以及使用多个流来重叠独立任务，或让拷贝与计算重叠（例如 Chapter 11 中描述的核间并发）。如果启动开销成为问题（例如有很多细小的核函数），可考虑用协作组（cooperative groups）将它们合并，或干脆把它们的代码合到一起（例如核函数融合）。
+
+*Increase GPU utilization* If the GPU is underutilized (e.g., low SM Active, low occupancy), ensure you launch enough work to use all SMs. Specifically, make sure your kernel is launching with a grid size large enough to fully utilize the GPU. A common mistake is launching as many threads as elements but forgetting that each thread does only a little bit of work. Sometimes you need multiple passes or more threads per element.
+
+*提高 GPU 利用率* 如果 GPU 利用不足（例如 SM Active 低、占用率低），要确保你启动了足够的工作来使用所有 SM。具体来说，确保你的核函数以足够大的网格大小启动，以充分利用 GPU。一个常见的错误是：启动的线程数与元素数一样多，却忘了每个线程只做一点点工作。有时你需要多趟处理，或为每个元素分配更多线程。
+
+*Reduce synchronizations and host-side (CPU) stalls* You should remove any unnecessary cudaDeviceSynchronize() or host-side waits that stall the GPU. If the workload is inherently small, consider batching it with other work or running multiple instances concurrently (e.g., CUDA streams). You can also use CUDA Graphs (see Chapter 12) to predefine and efficiently launch an execution graph of many small kernels.
+
+*减少同步与主机端（CPU）停顿* 你应当移除任何不必要的 cudaDeviceSynchronize() 或主机端等待，因为它们会让 GPU 停顿。如果工作负载本身很小，可考虑把它与其他工作合批，或并发运行多个实例（例如 CUDA 流）。你还可以使用 CUDA Graphs（见 Chapter 12）来预定义并高效启动一个由许多小核函数组成的执行图。
+
+*Leverage specialized hardware and reduced/mixed precision* Blackwell Tensor Cores expose fifth-generation MMA instructions in PTX as tcgen05.mma and associated loads/stores (e.g., tcgen05.ld and tcgen05.st). Tensor Cores accelerate microscaling formats including MXFP8, MXFP4 (OCP MX formats), and NVIDIA’s NVFP4 format. They also support block-scaled matmuls (K-grouped) that libraries select automatically when scale metadata is present. TMEM and TMA underpin these high-throughput data paths. We’ll discuss these techniques in more detail later in this chapter and in Chapter 9.
+
+*利用专用硬件和降精度/混合精度* Blackwell Tensor Core 在 PTX 中以 tcgen05.mma 及相关的 load/store（例如 tcgen05.ld 和 tcgen05.st）形式暴露第五代 MMA 指令。Tensor Core 可加速包括 MXFP8、MXFP4（OCP MX formats）以及 NVIDIA 的 NVFP4 格式在内的微缩放格式。它们还支持块缩放矩阵乘法（K-grouped），当存在缩放元数据时库会自动选用。TMEM 和 TMA 支撑着这些高吞吐的数据通路。我们会在本章后面以及 Chapter 9 中更详细地讨论这些技术。
+
+*Verify and iterate* After each optimization, reprofile. Confirm the targeted stall or metric improved (e.g., memory stalls reduced after tiling, achieved occupancy went up after tuning block size, “SM Throughput %” increased after using CUDA streams, etc.). Also watch total runtime improvement. Sometimes one bottleneck masks another; you might fix memory bandwidth only to become compute bound next (which is fine—then address that if needed).
+
+*验证并迭代* 每次优化之后都要重新剖析。确认目标停顿或指标是否改善（例如 tiling 后内存停顿减少、调整 block size 后实测占用率上升、使用 CUDA 流后“SM Throughput %”提高等等）。同时关注总运行时的改善。有时一个瓶颈会掩盖另一个瓶颈；你可能刚修好内存带宽，接着又变成计算受限（这没关系——需要的话再去处理它）。
+
+*Maintain correctness and acceptable accuracy* When using lower-precision or new parallel strategies, test with assertions or comparisons to reference results. Ensure the speedup doesn’t come at the cost of accuracy unless that’s acceptable for the application. Typically, techniques like FP16 or even FP8 are carefully validated to have negligible accuracy impact on AI models.
+
+*保持正确性与可接受的精度* 在使用更低精度或新的并行策略时，要用断言或与参考结果的比较来测试。确保加速不是以牺牲精度为代价——除非这对应用来说是可接受的。通常，像 FP16 乃至 FP8 这样的技术都会经过仔细验证，以确保对 AI 模型的精度影响可以忽略不计。
+
+## Tuning Occupancy
+
+## 占用率调优
+
+Remember from Chapter 6 that occupancy is the ratio of active warps on the SM to the maximum number of warps that could be active on the SM. Low occupancy (< 50%) means that, on average, half of the possible warps were active. This might indicate that your kernel is limited by resources such as registers or shared memory per thread block—rather than just available parallelism.
+
+回忆 Chapter 6 的内容，占用率是 SM 上活跃 warp 数与 SM 上可能活跃的最大 warp 数之比。低占用率（< 50%）意味着平均而言只有一半可能的 warp 处于活跃状态。这可能表明你的核函数受到诸如每线程块的寄存器或共享内存等资源的限制——而不仅仅是受可用并行度的限制。
+
+*Occupancy* is the measure of how many threads, or warps, are active on an SM relative to the hardware’s maximum capacity. Higher occupancy, or more warps in flight, allows the GPU to better hide latency. This is because when one warp stalls waiting on a memory load, for instance, the scheduler can quickly switch to run another warp.
+
+*占用率* 衡量的是相对于硬件最大容量，有多少线程（或 warp）在一个 SM 上处于活跃状态。更高的占用率（即更多 warp 在途）能让 GPU 更好地隐藏延迟。这是因为，例如当一个 warp 停顿等待内存 load 时，调度器可以迅速切换去运行另一个 warp。
+
+More warps per SM generally means the GPU’s pipelines stay busier, and fewer cycles are wasted waiting on memory. *Occupancy tuning* is the practice of adjusting your kernel launch parameters and resource usage (e.g., registers and shared memory) to maximize useful parallelism on each SM, as shown in Figure 8-6.
+
+每个 SM 上更多的 warp 通常意味着 GPU 的流水线更繁忙，浪费在等待内存上的周期更少。*占用率调优* 就是调整你的核函数启动参数和资源使用（例如寄存器和共享内存），以在每个 SM 上最大化有用并行度的实践，如图 8-6 所示。
+
+![Figure 8-6. Tuning occupancy by balancing resource usage (e.g., registers per thread and shared memory) with parallelism (e.g., number of threads and warps)](AI%20Systems%20Performance%20Engineering-ch8_images/figure-8-6.png)
+
+![图 8-6. 通过在资源使用（例如每线程寄存器和共享内存）与并行度（例如线程数和 warp 数）之间取得平衡来调优占用率](AI%20Systems%20Performance%20Engineering-ch8_images/figure-8-6.png)
+
+Remember that the goal of occupancy tuning is to keep enough warps active to fully utilize the SM’s pipelines and hide long‐latency operations. In an ideal case, you would achieve 100% occupancy, filling all available warp slots. For instance, there are 64 warp slots, or 2,048 threads, available in each Blackwell B200 (compute capability 10.0) SM.
+
+请记住，占用率调优的目标是保持足够多的 warp 处于活跃状态，以充分利用 SM 的流水线并隐藏长延迟操作。在理想情况下，你会达到 100% 占用率，填满所有可用的 warp 槽。例如，每个 Blackwell B200（compute capability 10.0）SM 中有 64 个 warp 槽，即 2,048 个线程可用。
+
+> This per-SM limit of 64 warps has remained the same for modern datacenter GPU architectures like Ampere, Hopper, and Blackwell—even as the overall GPU core counts have increased. The hardware-performance improvements come from more SMs, larger caches, multidie, etc. You can use Nsight Compute’s Occupancy analysis to confirm the exact limits on your target device. Interestingly, the NVIDIA RTX PRO 6000 and Spark DGX (GB10 superchip) support a higher compute capability (12.x), but only allow 48 warps (1,536 threads) per SM.
+
+> 这个每 SM 64 warps 的上限，在诸如 Ampere、Hopper 和 Blackwell 等现代数据中心 GPU 架构中一直保持不变——即便整体 GPU 核心数量在增加。硬件性能的提升来自更多的 SM、更大的缓存、多晶粒（multidie）等。你可以使用 Nsight Compute 的 Occupancy 分析来确认目标设备上的确切上限。有意思的是，NVIDIA RTX PRO 6000 和 Spark DGX（GB10 超级芯片）支持更高的计算能力（12.x），但每个 SM 只允许 48 warps（1,536 threads）。
+
+Many real‐world kernels still perform well at lower occupancy—especially if their memory or arithmetic latencies are already small. Or if they leverage highthroughput units like Tensor Cores that keep the pipelines busy without needing as many active warps.
+
+许多现实世界中的核函数在较低占用率下仍表现良好——尤其是当它们的内存或算术延迟本身就已经很小时。或者当它们利用像 Tensor Core 这样的高吞吐单元时，无需那么多活跃 warp 就能让流水线保持繁忙。
+
+For instance, a compute-bound kernel might achieve peak performance with only 50% occupancy because each warp is doing lots of work without waiting. In contrast, a memory-bound kernel often benefits from high occupancy since some warps can run on the SM since other warps are stalled waiting for memory transfers.
+
+例如，一个计算受限的核函数可能仅在 50% 占用率下就达到峰值性能，因为每个 warp 都在做大量工作而不需要等待。相比之下，访存受限的核函数往往能从高占用率中获益，因为当一些 warp 停顿等待内存传输时，另一些 warp 仍可在 SM 上运行。
+
+### Find the Right Occupancy for Your Workload
+
+### 为你的工作负载找到合适的占用率
+
+In practice, effective occupancy tuning often produces diminishing returns after a certain point. If a kernel is severely memory bound, for instance, going from 10% to 50% achieved occupancy might give a huge boost because now you have enough warps to cover latency.
+
+在实践中，有效的占用率调优往往在某个点之后就出现收益递减。例如，如果一个核函数严重访存受限，那么把实测占用率从 10% 提升到 50% 可能带来巨大的提升，因为此时你已经有足够的 warp 来覆盖延迟。
+
+But going from 50% to 100% might give only a small further gain since other factors start to dominate, such as cache misses, memory bandwidth saturation, etc. Profiling helps determine the optimal occupancy. For example, you can evaluate profile metrics such as *eligible warps per cycle* and *active warps per scheduler*. These give insight into how many warps are ready to issue versus how many the hardware could handle.
+
+但从 50% 提升到 100% 可能只带来很小的进一步收益，因为此时其他因素开始占主导，比如缓存未命中、内存带宽饱和等等。剖析有助于确定最优占用率。例如，你可以评估诸如 *每周期可发射 warp 数*（eligible warps per cycle）和 *每调度器活跃 warp 数*（active warps per scheduler）等剖析指标。它们能让你洞察有多少 warp 已就绪可发射，相比之下硬件又能处理多少。
+
+Eligible warps per cycle reports the average number of warps that are in a “ready-to-run” state each cycle and have no outstanding data or dependency stalls. Active warps per scheduler, often equal to the number of schedulers on the SM, is the maximum number of warps that could issue an instruction per cycle.
+
+每周期可发射 warp 数报告的是每个周期处于“就绪可运行”状态、且没有未完成的数据或依赖停顿的 warp 平均数量。每调度器活跃 warp 数通常等于 SM 上调度器的数量，是每个周期可以发射一条指令的最大 warp 数。
+
+If eligible warps per cycle is lower than active warps per scheduler, the GPU often runs out of ready warps. In this case, when one warp stalls on memory or a long-latency instruction, there isn’t another ready warp to switch to. This indicates you need more concurrency in the form of higher occupancy or ILP to hide the latency.
+
+如果每周期可发射 warp 数低于每调度器活跃 warp 数，那么 GPU 常常会用尽就绪的 warp。这种情况下，当一个 warp 在内存或一条长延迟指令上停顿时，就没有另一个就绪的 warp 可以切换过去。这表明你需要以更高占用率或更多 ILP 的形式增加并发，以隐藏延迟。
+
+In contrast, if eligible warps per cycle meets or exceeds the scheduler limit but your kernel still runs slowly, it means you have enough warps ready, but they cannot issue because of other stalls such as memory-bandwidth saturation or execution dependencies. In this case, it’s best to focus on hiding memory latency through better coalescing and asynchronous copies—or increasing ILP by unrolling independent work. This is a better approach than simply adding more threads.
+
+反过来，如果每周期可发射 warp 数达到或超过调度器上限，而你的核函数仍然运行缓慢，那就意味着你有足够多就绪的 warp，但它们由于其他停顿（比如内存带宽饱和或执行依赖）而无法发射。这种情况下，最好把重点放在通过更好的合并访问和异步拷贝来隐藏内存延迟——或通过展开独立工作来增加 ILP 上。这比单纯增加线程数是更好的做法。
+
+And if you raise occupancy and see the “Stall: Not Selected” or idle percentages drop, and memory pipes are busy more often, you’ve successfully improved occupancy. If occupancy is high but Long Scoreboard is still dominant, you might need other techniques like improving memory access patterns or overlapping computation.
+
+而如果你提高了占用率，并看到“Stall: Not Selected”或空闲百分比下降、内存流水线更频繁地繁忙，那么你就成功地改善了占用率。如果占用率很高但 Long Scoreboard 仍占主导，你可能需要其他技术，比如改善内存访问模式或重叠计算。
+
+In practice, once you reach a moderate occupancy (e.g., 60%–70%), the returns will start to diminish. As such, it’s often more effective to pursue better memory locality, higher ILP, and the use of on-chip memory like shared memory and registers to cache data.
+
+在实践中，一旦你达到中等占用率（例如 60%–70%），收益就会开始递减。因此，去追求更好的内存局部性、更高的 ILP，以及使用像共享内存和寄存器这样的片上内存来缓存数据，往往更为有效。
+
+While maximizing occupancy ensures that many warps are available to run, those warps might still be idle if waiting on memory or if executing divergent code. Therefore, after achieving a reasonable occupancy (e.g., 50%–70%), focus on warp efficiency and latency-hiding rather than obsessing over 100% occupancy.
+
+尽管最大化占用率能确保有许多 warp 可供运行，但如果这些 warp 在等待内存或在执行分歧代码，它们仍可能处于空闲。因此，在达到合理占用率（例如 50%–70%）之后，应把重点放在 warp 效率和延迟隐藏上，而不是一味纠结于 100% 占用率。
+
+> Occupancy is a means to an end (hiding latency), not the end goal itself. Once you have enough warps to keep the GPU busy, other optimizations will give better returns.
+
+> 占用率是达成目的（隐藏延迟）的手段，而非目的本身。一旦你有足够多的 warp 让 GPU 保持繁忙，其他优化将带来更好的回报。
+
+### Techniques for Occupancy Tuning
+
+### 占用率调优技术
+
+There are a few straightforward steps to improve occupancy when profiling suggests that it’s the limiting factor: increase parallelism by launching more threads, adjust the block size, reduce per-thread resource usage, and use __launch_bounds__ or the occupancy API. Let’s discuss each of these here:
+
+当剖析表明占用率是限制因素时，有几个直截了当的步骤可以提高占用率：通过启动更多线程来增加并行度、调整 block size、减少每线程资源使用，以及使用 __launch_bounds__ 或占用率 API。下面我们逐一讨论：
+
+*Increase parallelism (launch more threads)* The simplest way to improve occupancy is to launch more work if your current kernel launch isn’t already using all SMs. For instance, if you launch only 20 warps per SM and the GPU can support 64, increasing your grid size or threads per block can raise occupancy (assuming enough data to process).
+
+*增加并行度（启动更多线程）* 提高占用率最简单的方法是：如果当前的核函数启动尚未用满所有 SM，就启动更多工作。例如，如果你每个 SM 只启动了 20 warps，而 GPU 能支持 64，那么增大网格大小或每块线程数就能提高占用率（前提是有足够的数据要处理）。
+
+Be sure to utilize all SMs by launching at least as many blocks as SMs—and often many more since blocks execute in parallel on each SM. If your GPU shows low “SM Active Cycles” because not all SMs have work, scale up the workload or batch size. However, simply using more threads isn’t enough—especially if each thread uses a lot of resources such as registers and shared memory.
+
+务必通过至少启动与 SM 数量一样多的线程块来利用所有 SM——而且往往要多得多，因为线程块在每个 SM 上并行执行。如果你的 GPU 因为并非所有 SM 都有工作而显示出较低的“SM Active Cycles”，就扩大工作负载或批大小。然而，仅仅使用更多线程还不够——尤其是当每个线程使用大量资源（比如寄存器和共享内存）时。
+
+*Adjust block size* Sometimes the number of threads per block, or thread-block size, can limit occupancy. Very large thread blocks (e.g., 1,024 threads) might use so many registers or so much shared memory that only one block can fit on an SM at a time. This results in low occupancy. In contrast, using moderately sized blocks (e.g., 128–256 threads) allows multiple blocks to reside concurrently on one SM, which increases the total number of possible active warps.
+
+*调整 block size* 有时每块线程数（即 thread-block size）会限制占用率。非常大的线程块（例如 1,024 threads）可能使用如此多的寄存器或如此多的共享内存，以至于一个 SM 上一次只能容纳一个线程块。这会导致低占用率。相比之下，使用中等大小的线程块（例如 128–256 threads）允许多个线程块同时驻留在一个 SM 上，从而增加可能活跃的 warp 总数。
+
+The optimal block size can vary by kernel. The key is to balance block size against resource usage. Smaller blocks use fewer resources individually and therefore allow more blocks in parallel.
+
+最优的 block size 会因核函数而异。关键在于在 block size 与资源使用之间取得平衡。较小的线程块单个使用的资源更少，因而允许更多线程块并行。
+
+You can use the built-in Nsight Compute Occupancy Calculator and the CUDA Occupancy API to experiment with different launch configurations to help find a sweet spot that maximizes occupancy without incurring other overheads.
+
+你可以使用内置的 Nsight Compute Occupancy Calculator 和 CUDA 占用率 API 来试验不同的启动配置，帮助找到一个既能最大化占用率又不引入其他开销的最佳点。
+
+The Occupancy Calculator suggests configurations for maximum theoretical occupancy. However, the best performance in practice might come from an occupancy that is slightly less than this theoretical maximum.
+
+Occupancy Calculator 会给出可实现最大理论占用率的配置建议。然而，实践中最佳性能可能来自略低于该理论最大值的占用率。
+
+> Always validate the Occupancy Calculator’s suggested best BlockSize with actual timing experiments, as sometimes a configuration with a bit lower occupancy produces higher throughput due to less register spilling or better memory coalescing.
+
+> 始终用实际的计时实验来验证 Occupancy Calculator 建议的最佳 BlockSize，因为有时占用率略低一些的配置反而能产生更高的吞吐，这可能是由于更少的寄存器溢出或更好的内存合并访问。
+
+*Reduce per‐thread register and shared-memory usage* Each thread consumes registers—and likely shared memory. If a kernel uses too many registers or shared memory per thread, the compiler must reduce how many threads or warps can be active on an SM. Otherwise, it will exceed the SM’s total register file or shared-memory allocation.
+
+*减少每线程的寄存器和共享内存使用* 每个线程都会消耗寄存器——而且很可能还有共享内存。如果一个核函数每线程使用了过多的寄存器或共享内存，编译器就必须减少一个 SM 上可以活跃的线程或 warp 数量。否则，就会超出 SM 的总寄存器堆或共享内存分配。
+
+To address register usage, you can refactor your code to use fewer live variables, and therefore fewer registers, to free up register capacity. This allows more warps to be resident simultaneously. Similarly, you can pass -maxrregcount=<N> to the compiler to cap the number of registers allocated per thread.
+
+要解决寄存器使用问题，你可以重构代码，使用更少的活跃变量，从而使用更少的寄存器，以腾出寄存器容量。这允许更多 warp 同时驻留。类似地，你可以向编译器传递 -maxrregcount=<N> 来限制每线程分配的寄存器数量。
+
+When you cap the number of registers per thread, the compiler is forced to fit each thread into fewer registers. This allows the hardware to schedule additional warps on the SM—and therefore raises occupancy.
+
+当你限制每线程的寄存器数量时，编译器就被迫把每个线程塞进更少的寄存器中。这允许硬件在 SM 上调度额外的 warp——从而提高占用率。
+
+Of course, if you cap registers too aggressively, the compiler will spill excess variables into local memory, which will hurt performance. As such, you should find the smallest register limit that maximizes occupancy without excessive spilling. Similarly, if each block uses a large amount of shared memory such as a large tile, shared memory will limit how many blocks fit on an SM. By optimizing the shared memory footprint, storing only what’s needed, and using on-chip caches when possible, you can free up capacity for additional blocks. Essentially, you can increase occupancy by using leaner resources per thread/block.
+
+当然，如果你把寄存器限制得过于激进，编译器就会把多余的变量溢出到局部内存，这会损害性能。因此，你应当找到那个能在不产生过多溢出的前提下最大化占用率的最小寄存器上限。同样地，如果每个线程块使用大量共享内存（比如一个大的 tile），共享内存就会限制一个 SM 上能容纳多少线程块。通过优化共享内存占用、只存储所需内容，并在可能时使用片上缓存，你可以腾出容量以容纳更多线程块。本质上，你可以通过让每个线程/线程块使用更精简的资源来提高占用率。
+
+Be mindful, however, that reducing registers or shared memory might degrade single-thread performance if taken too far. It’s a trade-off. The profiler’s Occupancy limiter readout will tell you if registers or shared memory are the bottleneck. This will help guide your optimization efforts.
+
+不过要注意，如果做得太过，减少寄存器或共享内存可能会降低单线程性能。这是一种权衡。剖析器的 Occupancy limiter 读数会告诉你到底是寄存器还是共享内存成为瓶颈。这将有助于指导你的优化工作。
+
+For instance, on Blackwell, you may see “Limited by max registers per thread” if you aggressively unroll loops. In this case, consider using fewer unrolled iterations or splitting the work. This is because Blackwell has a 255 register-per-thread limit. The Occupancy report helps quantify these trade-offs.
+
+例如，在 Blackwell 上，如果你激进地展开循环，可能会看到“Limited by max registers per thread”。这种情况下，考虑使用更少的展开迭代次数或拆分工作。这是因为 Blackwell 有 255 register-per-thread 的上限。Occupancy 报告有助于量化这些权衡。
+
+*Use* __launch_bounds__ In some scenarios, you might deliberately limit occupancy or guide the compiler to optimize for a specific occupancy. CUDA allows you to set launch bounds in the kernel code using the __launch_bounds__ annotation. This gives a hint to the compiler of the kernel’s intended usage pattern and launch configuration.
+
+*使用* __launch_bounds__ 在某些场景下，你可能会刻意限制占用率，或引导编译器针对特定占用率进行优化。CUDA 允许你在核函数代码中使用 __launch_bounds__ 注解来设置启动界限。这会向编译器提示该核函数预期的使用模式和启动配置。
+
+If you profile and find that performance peaks at an occupancy around 50% rather than 100%, it often means that each thread is using a lot of registers or shared memory. This will further limit occupancy. In such cases, you can guide the compiler using __launch_bounds__.
+
+如果你剖析后发现性能在大约 50%（而非 100%）的占用率处达到峰值，这往往意味着每个线程使用了大量寄存器或共享内存。这会进一步限制占用率。在这种情况下，你可以使用 __launch_bounds__ 来引导编译器。
+
+For example, you can use __launch_bounds__ to limit the threads-per-block and specify a minimum blocks-per-SM to allow more warps to reside on the SM. Essentially, you’re telling the compiler to trade some per-thread register/shared-memory resource usage for a higher warp count.
+
+例如，你可以使用 __launch_bounds__ 来限制每块线程数，并指定一个最小的每 SM 线程块数，以允许更多 warp 驻留在 SM 上。本质上，你是在告诉编译器用一些每线程的寄存器/共享内存资源使用来换取更高的 warp 数量。
+
+This will improve throughput when your kernel is latency bound because more warps will hide memory latency and dependency stalls. This is opposed to a purely compute-bound kernel, which wouldn’t see the same gain from this type of optimization.
+
+当你的核函数是延迟受限时，这会提高吞吐，因为更多 warp 将隐藏内存延迟和依赖停顿。这与纯计算受限的核函数不同，后者不会从这类优化中看到同样的收益。
+
+*Use the CUDA Occupancy API* In addition to the __launch_bounds__ annotation, CUDA’s Occupancy API functions (e.g., cudaOccupancyMaxPotentialBlockSize() and cudaOccupancyMax ActiveBlocksPerMultiprocessor()) let you determine, at runtime, the block size that produces the highest occupancy given your kernel’s actual register and shared‐memory demands.
+
+*使用 CUDA 占用率 API* 除了 __launch_bounds__ 注解之外，CUDA 的占用率 API 函数（例如 cudaOccupancyMaxPotentialBlockSize() 和 cudaOccupancyMaxActiveBlocksPerMultiprocessor()）能让你在运行时，根据核函数实际的寄存器和共享内存需求，确定可产生最高占用率的 block size。
+
+These functions provide recommended values for threads per block and the number of blocks per SM. This way, you don’t have to guess which configuration is most efficient. In practice, you might use the Occupancy API to find a candidate block size and then fine‐tune it with a __launch_bounds__ hint to lock in a specific occupancy level.
+
+这些函数会提供每块线程数以及每 SM 线程块数的推荐值。这样，你就不必猜测哪种配置最高效。在实践中，你可能会用占用率 API 找到一个候选 block size，然后再用 __launch_bounds__ 提示对其进行微调，以锁定一个特定的占用率水平。
+
+> Another approach is to use CUDA Graphs to launch predefined workloads efficiently once you’ve determined the optimal configuration. While not directly changing occupancy, CUDA Graphs can reduce per-launch overhead, which is beneficial for occupancy when you increase the number of blocks. We’ll cover CUDA Graphs in Chapter 12 and PyTorch’s use of CUDA Graphs in Chapters 13 and 14, but it’s worth mentioning them in this context. In short, it’s recommended to use a multiphased approach by profiling your system to discover the ideal occupancy range—and then using compiler and runtime hints to achieve the ideal occupancy. The goal is to size your thread blocks efficiently to keep enough warps in flight without over allocating scarce on‐chip resources like registers and shared memory. Next, let’s take a closer look at tuning occupancy with __launch_bounds__, the Occupancy API, and PyTorch.
+
+> 另一种做法是：一旦你确定了最优配置，就使用 CUDA Graphs 来高效地启动预定义的工作负载。虽然它并不直接改变占用率，但 CUDA Graphs 可以减少每次启动的开销，当你增加线程块数量时，这对占用率是有益的。我们会在 Chapter 12 讨论 CUDA Graphs，并在 Chapter 13 和 14 讨论 PyTorch 对 CUDA Graphs 的使用，但在此背景下值得一提。简而言之，推荐采用多阶段的方法：先剖析你的系统以发现理想的占用率范围——然后使用编译器和运行时提示来达到理想占用率。目标是高效地设定线程块大小，让足够多的 warp 保持在途，同时又不过度分配像寄存器和共享内存这样稀缺的片上资源。接下来，让我们更仔细地看看如何用 __launch_bounds__、占用率 API 和 PyTorch 来调优占用率。
+
+### Compiler Hints to Optimize Occupancy
+
+### 用编译器提示优化占用率
+
+We can guide the compiler to optimize for occupancy by using CUDA’s __launch_bounds__ kernel annotation. This annotation lets us specify two parameters for a kernel: the maximum number of threads per block that we want to launch (e.g., 256) and the minimum number of thread blocks we want to keep resident on each SM (e.g., 4), as shown here:
+
+我们可以使用 CUDA 的 __launch_bounds__ 核函数注解来引导编译器针对占用率进行优化。这个注解让我们为核函数指定两个参数：我们想要启动的每块最大线程数（例如 256）和我们想在每个 SM 上保持驻留的最小线程块数（例如 4），如下所示：
+
+```
+__global__ __launch_bounds__(256, 8)
+void myKernel(...) { /* ... */ }
+```
+
+```
+__global__ __launch_bounds__(256, 8)
+void myKernel(...) { /* ... */ }
+```
+
+Here, we promise never to launch myKernel with more than 256 threads per block. And we request that the GPU tries to keep at least 8 blocks active per SM. These hints influence the compiler’s register allocation and inlining decisions.
+
+在这里，我们承诺绝不以每块超过 256 个线程来启动 myKernel。并且我们请求 GPU 尽量让每个 SM 上至少有 8 个线程块处于活跃状态。这些提示会影响编译器的寄存器分配和内联决策。
+
+Specifically, __launch_bounds__ will limit each thread’s register usage such that up to 256 threads can fit in one block—and at least 8 blocks can be active per SM. This is a total of 2,048 threads active per SM (8 blocks × 256 threads per block = 2,048 threads). This fills the thread slots for devices like the B200 with a 2,048-thread per-SM limit (e.g., Blackwell). In practice, __launch_bounds__ can cause the compiler to cap per-thread register usage and restrict unrolling/inlining. This avoids spilling and allows higher occupancy. As such, we are effectively trading a bit of per-thread performance (e.g., not using every last register or unrolling to the max) in exchange for steadier warp throughput by keeping more warps in flight.
+
+具体来说，__launch_bounds__ 会限制每个线程的寄存器使用，使得一个线程块中最多能容纳 256 个线程——并且每个 SM 上至少能有 8 个线程块活跃。这总共是每 SM 2,048 个活跃线程（8 blocks × 256 threads per block = 2,048 threads）。这就填满了像 B200 这类每 SM 有 2,048 线程上限的设备（例如 Blackwell）的线程槽。在实践中，__launch_bounds__ 会让编译器限制每线程寄存器使用，并约束展开/内联。这避免了溢出并允许更高的占用率。因此，我们实际上是在用一点点每线程性能（例如不用尽每一个寄存器，或不做最大程度的展开）来换取通过让更多 warp 保持在途而获得的更稳定的 warp 吞吐。
+
+> Increased occupancy must be balanced with increased per-thread resources. You want to avoid register spilling by forcing too many threads. This causes slow memory access because they run out of registers and spill to local memory (backed by global HBM.) Finding the sweet spot often requires experimentation. Nsight Compute’s “Registers per Thread” and “Occupancy” metrics can guide you here.
+
+> 提高占用率必须与增加的每线程资源相平衡。你要避免因强行塞入过多线程而导致寄存器溢出。这会造成缓慢的内存访问，因为它们用尽了寄存器并溢出到局部内存（由全局 HBM 支撑）。找到最佳点往往需要反复试验。Nsight Compute 的“Registers per Thread”和“Occupancy”指标可以在这里为你提供指引。
+
+### Determine Optimal Launch Configuration with the Occupancy API
+
+### 用占用率 API 确定最优启动配置
+
+You can determine an optimal launch configuration at runtime using the CUDA Occupancy API, including cudaOccupancyMaxActiveBlocksPerMultiprocessor() and cudaOccupancyMaxPotentialBlockSize(). For instance, cudaOccupancyMaxPotentialBlockSize() will calculate the block size that produces the optimal occupancy for a given kernel, considering its register and shared memory usage as shown here:
+
+你可以在运行时使用 CUDA 占用率 API 来确定最优启动配置，包括 cudaOccupancyMaxActiveBlocksPerMultiprocessor() 和 cudaOccupancyMaxPotentialBlockSize()。例如，cudaOccupancyMaxPotentialBlockSize() 会为给定的核函数计算出可产生最优占用率的 block size，并考虑其寄存器和共享内存使用，如下所示：
+
+```
+int minGridSize = 0, bestBlockSize = 0;
+
+cudaOccupancyMaxPotentialBlockSize(
+    &minGridSize, &bestBlockSize,
+    myKernel,
+    /* dynamicSmemBytes = */ 0,
+    /* blockSizeLimit = */ 0 );
+
+// bestBlockSize contains number of threads per block that maximizes occupancy
+myKernel<<<minGridSize, bestBlockSize>>>(...);
+```
+
+```
+int minGridSize = 0, bestBlockSize = 0;
+
+cudaOccupancyMaxPotentialBlockSize(
+    &minGridSize, &bestBlockSize,
+    myKernel,
+    /* dynamicSmemBytes = */ 0,
+    /* blockSizeLimit = */ 0 );
+
+// bestBlockSize contains number of threads per block that maximizes occupancy
+myKernel<<<minGridSize, bestBlockSize>>>(...);
+```
+
+This API computes how many threads per block would likely maximize occupancy given the kernel’s resource usage. We can then use the suggested bestBlockSize and minGridSize for our kernel launch.
+
+这个 API 会计算：给定核函数的资源使用，每块多少线程可能最大化占用率。然后我们就可以在核函数启动时使用建议的 bestBlockSize 和 minGridSize。
+
+In practice, the compiler’s heuristics are usually pretty good. But using __launch_bounds__ and the occupancy API can give you explicit control when needed. Use them when you know your kernel can trade some per-thread resource usage for more active warps. This helps prevent underoccupying SMs due to heavy threads.
+
+在实践中，编译器的启发式通常相当不错。但在需要时，使用 __launch_bounds__ 和占用率 API 可以给你明确的控制。当你知道自己的核函数可以用一些每线程资源使用来换取更多活跃 warp 时，就使用它们。这有助于防止因线程过重而导致 SM 占用不足。
+
+### Tuning Occupancy with PyTorch
+
+### 用 PyTorch 调优占用率
+
+For PyTorch users writing high-level code, you don’t usually manage occupancy directly—PyTorch’s CUDA kernels and libraries handle launch parameters under the hood. Operations like matrix multiplies, convolutions, etc., are already tuned to use the GPU effectively.
+
+对于编写高层代码的 PyTorch 用户来说，你通常不会直接管理占用率——PyTorch 的 CUDA 核函数和库会在底层处理启动参数。诸如矩阵乘法、卷积等操作已经过调优，能有效利用 GPU。
+
+However, understanding occupancy can still be valuable. If you write custom CUDA kernels as PyTorch extensions, the same principles apply: launch enough threads/blocks to utilize the GPU, choose reasonable block sizes, and avoid using excessive registers or shared memory per thread if it limits occupancy.
+
+不过，理解占用率仍然很有价值。如果你把自定义 CUDA 核函数写成 PyTorch 扩展，同样的原则依然适用：启动足够的线程/线程块来利用 GPU，选择合理的 block size，如果每线程使用过多寄存器或共享内存会限制占用率，就避免这样做。
+
+Even at the Python level, there are a few things to be mindful of. If you are using PyTorch and notice that your GPU is underutilized (e.g., in a profiling trace you see only a small fraction of SMs active), it could be because of very small tensor operations that don’t launch many threads.
+
+即便在 Python 层面，也有几点需要留意。如果你在使用 PyTorch，并注意到你的 GPU 利用不足（例如在剖析追踪中你看到只有一小部分 SM 处于活跃状态），这可能是因为非常小的张量操作没有启动多少线程。
+
+Extremely small workloads might not scale well to a large GPU. In such cases, try batching or combining operations so that each launch does more work. PyTorch’s graph compiler can fuse certain operations using torch.compile. This increases the work per kernel launch—and therefore improves occupancy and efficiency.
+
+极小的工作负载在大型 GPU 上可能扩展性不佳。在这种情况下，试着做批处理或合并操作，让每次启动做更多工作。PyTorch 的图编译器可以用 torch.compile 融合某些操作。这增加了每次核函数启动的工作量——从而提高占用率和效率。
+
+> Under the hood, torch.compile generates fused GPU kernels. It does this by merging many small operations into one larger kernel. Whenever possible, leverage the PyTorch compiler, as it can achieve the efficiency of a manually written CUDA kernel in some cases. Prefer torch.compile(mode="max-autotune") for long-running training/inference on stable shapes, or mode="reduce-overhead" for small-batch, graph-friendly loops. Both enable CUDA Graphs when profitable. You can also use mode="max-autotune-no-cudagraphs" if graphs are undesirable. We dive deep into the PyTorch compiler and its different mode options in Chapters 13 and 14.
+
+> 在底层，torch.compile 会生成融合的 GPU 核函数。它通过把许多小操作合并成一个更大的核函数来做到这一点。只要有可能，就利用 PyTorch 编译器，因为它在某些情况下能达到手写 CUDA 核函数的效率。对于在稳定形状上长时间运行的训练/推理，优先使用 torch.compile(mode="max-autotune")；对于小批量、对图友好的循环，则使用 mode="reduce-overhead"。两者都会在有利时启用 CUDA Graphs。如果不希望使用图，你还可以使用 mode="max-autotune-no-cudagraphs"。我们会在 Chapter 13 和 14 深入探讨 PyTorch 编译器及其不同的 mode 选项。
+
+It’s also worth noting that PyTorch’s built-in kernels often use best practices internally. For example, reduction operations and elementwise operations in PyTorch are implemented with launch configurators that pick an optimal block size and number of blocks based on the device and tensor size.
+
+同样值得注意的是，PyTorch 内置的核函数在内部往往采用了最佳实践。例如，PyTorch 中的归约操作和逐元素操作是用启动配置器（launch configurator）实现的，它们会根据设备和张量大小挑选最优的 block size 和线程块数量。
+
+If you ever dig into PyTorch’s C++ CUDA code, you’ll see logic to cap block sizes and to launch multiple blocks per SM for certain algorithms. This is essentially automated occupancy tuning. To reduce optimizer overhead, enable fused implementations where available. For instance, use torch.optim.AdamW(..., fused=True) and pair with automatic mixed-precision (AMP).
+
+如果你曾深入 PyTorch 的 C++ CUDA 代码，你会看到用于限制 block size 以及为某些算法在每个 SM 上启动多个线程块的逻辑。这本质上就是自动化的占用率调优。为了减少优化器开销，在可用时启用融合实现。例如，使用 torch.optim.AdamW(..., fused=True) 并搭配自动混合精度（AMP）。
+
+The takeaway for PyTorch users is to prefer high-level libraries and operations that are already optimized. This is in preference to writing custom kernels. If you do need custom kernels, apply the same occupancy principles that we discussed.
+
+对 PyTorch 用户来说，要点是优先使用已经优化好的高层库和操作。这优于编写自定义核函数。如果你确实需要自定义核函数，就应用我们讨论过的同样的占用率原则。
+
+Now that we see how to keep the GPU busy with enough threads, we next turn to making each warp more efficient. High occupancy means little if each warp is wasting cycles. This leads us to our discussion on warp-level efficiency optimizations, including warp divergence and intrawarp thread cooperation.
+
+既然我们已经看到如何用足够的线程让 GPU 保持繁忙，接下来我们转向如何让每个 warp 更高效。如果每个 warp 都在浪费周期，那么高占用率就没什么意义。这就引出了我们对 warp 层面效率优化的讨论，包括 warp 分歧和 warp 内线程协作。
+
+## Improving Warp Execution Efficiency (Warp Divergence)
+
+## 改善 Warp 执行效率（Warp 分歧）
+
+Even with plenty of warps available, thanks to good occupancy, each warp’s internal efficiency matters. Warp execution efficiency measures the fraction of warp lanes that are active on average. Warp-level inefficiencies arise when threads within a warp do not all do the same work, called *warp divergence*. Another cause is if the threads are waiting on data loads.
+
+即便得益于良好的占用率而有大量 warp 可用，每个 warp 内部的效率仍然重要。warp 执行效率衡量的是平均而言有多少比例的 warp 通道（lane）处于活跃状态。当一个 warp 内的线程并非都做相同工作时，就会产生 warp 层面的低效，这称为 *warp 分歧*（warp divergence）。另一个原因是线程在等待数据 load。
+
+Specifically, a low warp execution efficiency value typically shows a high divergent branch count, low predicate efficiency, and possibly a high number of memory-related stalls. This means that the warp threads are idle due to branching divergence caused by if/else statements in the kernel or by data-dependencies.
+
+具体来说，较低的 warp 执行效率值通常表现为高的分歧分支计数、低的谓词效率，以及可能较多的内存相关停顿。这意味着 warp 线程因核函数中 if/else 语句引起的分支分歧，或因数据依赖，而处于空闲状态。
+
+In this case, you should try to restructure your code to avoid the inefficiencies. To improve warp execution efficiency, you should try to improve memory coalescing, minimize thread divergence, and use warp-level intrinsics for optimal intrawarp (thread-level) communication.
+
+在这种情况下，你应当尝试重构代码以避免这些低效。要改善 warp 执行效率，你应当尝试改善内存合并访问、最小化线程分歧，并使用 warp 层面的内建函数来实现最优的 warp 内（线程层面）通信。
+
+These techniques often produce modest speedups (say, 5%–30%) compared to higher-level algorithmic changes, but they can be crucial in highly optimized code where every cycle counts. They also complement other optimizations in that, after you’ve optimized occupancy and improved memory access, you can still squeeze out extra performance by ensuring each warp executes as efficiently as possible.
+
+与更高层的算法改动相比，这些技术通常只带来适度的加速（比如 5%–30%），但在每一个周期都很珍贵的高度优化代码中，它们可能至关重要。它们还与其他优化互补，因为在你优化了占用率并改善了内存访问之后，你仍可以通过确保每个 warp 尽可能高效地执行来榨取额外的性能。
+
+### Causes of Warp Divergence
+
+### Warp 分歧的成因
+
+As mentioned in Chapter 7, warp divergence, or branch divergence, occurs when threads in the same warp take different control-flow paths. For example, consider an if/else inside a kernel where some threads in a warp execute the if clause and others execute the else.
+
+正如 Chapter 7 中提到的，warp 分歧（或分支分歧）发生在同一个 warp 中的线程走了不同的控制流路径时。例如，考虑核函数内部的一个 if/else，其中一个 warp 里的某些线程执行 if 子句，另一些线程执行 else。
+
+In SIMT execution, the warp must execute both paths serially: first, all threads that take the if branch execute while the others in that warp are masked off (idle). Then the threads that took else execute while the first group idles, as shown in Figure 8-7.
+
+在 SIMT 执行中，warp 必须串行执行两条路径：先由所有进入 if 分支的线程执行，此时该 warp 中的其余线程被掩蔽（masked off，处于空闲状态）；随后进入 else 分支的线程执行，而第一组线程则空闲，如图 8-7 所示。
+
+During the divergent sections, effectively only half, or some fraction, of the warp is doing useful work. This reduces overall throughput. In the case of a 50/50 split between if and else, the warp’s active utilization drops to 50% for that portion of code. If the split is 1 thread versus 31 threads, then 31/32 threads will be idle in one of the subbranches.
+
+在分歧段内，实际上只有半数——或某个比例——的 warp 在做有用工作。这会降低整体吞吐。如果 if 与 else 是 50/50 的对半分，那么在这段代码里 warp 的活跃利用率会降到 50%。若分裂为 1 个线程对 31 个线程，则在其中一个子分支里会有 31/32 的线程处于空闲。
+
+![Figure 8-7. Divergent versus nondivergent warp execution](AI%20Systems%20Performance%20Engineering-ch8_images/figure-8-7.png)
+
+![图 8-7. 分歧与非分歧的 warp 执行对比](AI%20Systems%20Performance%20Engineering-ch8_images/figure-8-7.png)
+
+> If your kernel contains multiple divergence points or if each divergent branch carries heavier work, removing those branches can compound these gains. In the ideal case (e.g., a 50/50 split branch), removing that divergent branch can nearly double throughput up to ~2× speedup. Eliminating multiple heavy divergence paths can compound these gains.
+
+> 如果你的核函数包含多个分歧点，或者每个分歧分支承载更繁重的工作，那么消除这些分支能让上述收益叠加。在理想情形下（例如 50/50 对半分的分支），消除该分歧分支可将吞吐几乎翻倍，达到约 ~2× 的加速。消除多条繁重的分歧路径能让这些收益叠加。
+
+The overall effect is that warp divergence causes some GPU cores to sit idle. This increases the total instruction count since each branch path is executed serially by different subsets of threads. Therefore, minimizing intrawarp divergence is a key to warp-level efficiency.
+
+总体效果是：warp 分歧会让部分 GPU 核心闲置。由于每条分支路径都由不同的线程子集串行执行，这也增加了指令总数。因此，尽量减少 warp 内分歧（intrawarp divergence）是 warp 级效率的关键。
+
+### Techniques to Avoid Warp Divergence
+
+### 避免 Warp 分歧的技巧
+
+There are various best practices to minimize warp divergence, including restructuring conditions and separating branches into multiple kernels.
+
+最小化 warp 分歧有多种最佳实践，包括重构条件以及将分支拆分到多个核函数中。
+
+> Warp divergence only affects threads within a warp. Threads in different warps do not cause each other to stall.
+
+> warp 分歧只影响一个 warp 内部的线程。不同 warp 中的线程不会相互造成停顿。
+
+Additionally, you can use warp-unanimous branches, warp-vote intrinsics, and predication. Let’s discuss each of these:
+
+此外，你还可以使用 warp 一致分支（warp-unanimous branch）、warp 投票内建函数（warp-vote intrinsics）以及谓词化（predication）。下面逐一讨论：
+
+*Restructure conditions* Wherever possible, organize your computations so that threads in the same warp follow the same execution path. This might involve moving a divergent condition to a higher level outside of the inner loops—or into a separate kernel launch. You could also sort or group your data so that each warp handles more homogeneous cases.
+
+*重构条件* 在可能的情况下，组织你的计算，使同一 warp 中的线程遵循相同的执行路径。这可能意味着把分歧条件上移到内层循环之外——或移入单独的核函数启动中。你也可以对数据进行排序或分组，使每个 warp 处理更同质的情形。
+
+For instance, if you have an array of values and you want to process negative values differently from nonnegative ones, a naive approach might put an if(x<0) inside the kernel that diverges per element. A smarter approach is to partition the data such that one kernel handles all negatives and another kernel handles nonnegatives. By aligning data with warps, you reduce the chance that a single warp has to split its execution.
+
+例如，如果你有一个数值数组，希望对负值和非负值区别处理，朴素的做法可能是在核函数内放一个 if(x<0)，从而按元素产生分歧。更聪明的做法是对数据进行划分，让一个核函数处理所有负值，另一个核函数处理非负值。通过让数据与 warp 对齐，你降低了单个 warp 不得不分裂执行的概率。
+
+*Separate into multiple kernels* Another approach is to separate the work into multiple kernel launches such that one kernel handles the if case and another handles the else case. You can use a prefix sum or compaction to distribute threads to the different kernels. This avoids divergence at the cost of launching more kernels and adding logic to distribute data between the kernels. This might be worth it if divergence is a big issue and the divergent sections are large enough in instruction count.
+
+*拆分到多个核函数* 另一种方法是把工作拆分到多次核函数启动，使一个核函数处理 if 情形、另一个核函数处理 else 情形。你可以用前缀和（prefix sum）或压紧（compaction）把线程分派到不同的核函数。这以启动更多核函数、并增加在核函数间分派数据的逻辑为代价来避免分歧。如果分歧问题很严重、且分歧段的指令数足够大，这样做可能是值得的。
+
+*Rewrite conditions to be warp-unanimous* In some cases, you can rewrite a condition to be *warp-unanimous*. This means that either all 32 threads in a warp satisfy the condition or none do. A common trick is to use the warp index in the condition statement. For instance, you first compute a warp ID as int warpId = threadIdx.x / 32;. Then half of your warps do task A and the other half do task B. For this, you write: if (warpId % 2 == 0) { /* Task A */ } else { /* Task B */ }.
+
+*把条件改写为 warp 一致* 在某些情形下，你可以把条件改写为 *warp 一致*（warp-unanimous）。这意味着一个 warp 中的 32 个线程要么全部满足条件、要么全都不满足。一个常用技巧是在条件语句中使用 warp 索引。例如，你先计算一个 warp ID：int warpId = threadIdx.x / 32;。然后让一半的 warp 做任务 A、另一半做任务 B。为此你写：if (warpId % 2 == 0) { /* Task A */ } else { /* Task B */ }。
+
+In this case, all threads in a given warp either go into task A or task B together, and there’s no warp divergence since one warp executes one branch while another warp executes the other branch. But within a single warp, all threads agree on the branch to execute.
+
+在这种情况下，给定 warp 中的所有线程要么一起进入任务 A、要么一起进入任务 B，不存在 warp 分歧，因为一个 warp 执行一条分支、而另一个 warp 执行另一条分支。但在单个 warp 内部，所有线程对要执行的分支达成一致。
+
+The slight overhead is that every warp still evaluates the branch condition, but since they all agree on it, each warp executes only one of the branches. This technique essentially trades some flexibility—since you’re constraining how work is divided—to gain warp coherence.
+
+轻微的开销在于每个 warp 仍要计算分支条件，但由于它们对条件的结论一致，每个 warp 只执行其中一条分支。这一技巧本质上是牺牲一些灵活性——因为你约束了工作的划分方式——来换取 warp 一致性。
+
+> Use warp-unanimous branches when you can divide work into coarse increments of 32 threads.
+
+> 当你能把工作按 32 线程的粗粒度增量来划分时，就使用 warp 一致分支。
+
+*Utilize warp-vote parallel algorithms* Warp intrinsics (__ballot_sync, __any_sync, __all_sync), cooperative-groups’ warp.ballot/any/all, and device-side vote masks (%WarpVote) let a warp collectively decide, or vote, which lanes need “special” work. The warp then dynamically delegates, repartitions, and compacts that work into one (or a few) lane(s) instead of diverging all 32 threads. This avoids per-lane branch divergence but introduces some potential load-imbalance trade-offs that you should profile for impact. We will cover warp intrinsics in more detail in a bit.
+
+*利用 warp 投票并行算法* warp 内建函数（__ballot_sync、__any_sync、__all_sync）、协作组（cooperative groups）的 warp.ballot/any/all，以及设备端投票掩码（%WarpVote），能让一个 warp 集体决定，或投票，出哪些通道（lane）需要“特殊”工作。随后该 warp 动态地把这些工作委派、重划分并压紧到一个（或少数几个）通道中，而不是让全部 32 个线程分歧。这避免了逐通道的分支分歧，但引入了一些潜在的负载不均衡权衡，你应剖析其影响。稍后我们会更详细地介绍 warp 内建函数。
+
+*Predicate short lanes* The CUDA compiler will sometimes *predicate* short conditional code. Predication means that the compiler converts an if into a boolean mask for each thread—and executes both paths for all threads. However, it only commits the results appropriate to each thread’s path.
+
+*对少数通道使用谓词* CUDA 编译器有时会对短的条件代码进行 *谓词化*（predicate）。谓词化意味着编译器把 if 转换为每个线程的布尔掩码——并对所有线程都执行两条路径。但它只提交与各线程路径相符的结果。
+
+Predication avoids divergent branching at the cost of doing extra work per thread. This is beneficial when the branches are very short and divergence is high. As a programmer, you can encourage predication by writing branch-free constructs, including the ?: ternary operator or bitwise logic tricks for simple conditions. For instance, consider this naive implementation, which uses an if/else statement:
+
+谓词化以每线程多做一些工作为代价来避免分歧分支。当分支非常短、且分歧程度高时，这样做是有益的。作为程序员，你可以通过编写无分支结构来鼓励谓词化，包括对简单条件使用 ?: 三元运算符（ternary operator）或位运算技巧。例如，考虑下面这个使用 if/else 语句的朴素实现：
+
+```
+if (x > 0)
+    y = f(x);
+else
+    y = g(x);
+```
+
+```
+if (x > 0)
+    y = f(x);
+else
+    y = g(x);
+```
+
+Instead, you could write the following, which computes both f(x) and g(x) for all threads but multiplies each result by cond to select the result that matches the condition:
+
+作为替代，你可以写成下面这样：对所有线程都计算 f(x) 和 g(x)，再把每个结果乘以 cond，以选出与条件相符的结果：
+
+```
+float cond = x > 0 ? 1.0f : 0.0f;
+y = cond * f(x) + (1.0f - cond) * g(x);
+```
+
+```
+float cond = x > 0 ? 1.0f : 0.0f;
+y = cond * f(x) + (1.0f - cond) * g(x);
+```
+
+Here, there’s no branch, thus no divergence, but we did extra work for each thread since both functions still run, including the one that wasn’t needed for a given case. As such, predication is worthwhile only if the extra work is cheaper than the cost of divergence would be. In practice, you should profile the effects of these optimizations. Specifically, if using predication, check metrics like “predicated-off threads” and overall instruction count. Profilers like Nsight Compute will show if predication is reducing warp stalls—or if it’s performing unnecessary work that reduces goodput.
+
+这里没有分支，因此没有分歧，但我们为每个线程多做了工作，因为两个函数仍都会运行，包括在给定情形下并不需要的那个。因此，只有当额外的工作比分歧本应付出的代价更便宜时，谓词化才值得。实践中，你应剖析这些优化的效果。具体来说，如果使用谓词化，请检查“predicated-off threads”（被谓词关闭的线程）以及总指令数等指标。像 Nsight Compute 这样的剖析器会显示谓词化是否在减少 warp 停顿——或者它是否在做不必要的工作而降低有效吞吐（goodput）。
+
+Typically, predication is good for very short, simple branches with just a few instructions each—especially if many warps would diverge due to the given conditions. So if the branch involves a lot of work—or only a handful of threads diverge—predication could actually be worse. Use this technique carefully—and only for small conditional workloads.
+
+一般来说，谓词化适合非常短、简单、每条只有寥寥几条指令的分支——尤其是在给定条件下会有许多 warp 分歧时。所以如果分支涉及大量工作——或只有少数几个线程分歧——谓词化实际上可能更糟。请谨慎使用这一技巧——并仅用于小规模的条件工作负载。
+
+> CUDA compilers will often apply simple predication automatically for you, but it’s still worth profiling for performance-critical kernels.
+
+> CUDA 编译器往往会自动为你应用简单的谓词化，但对性能关键的核函数，仍值得进行剖析。
+
+In short, minimizing warp divergence requires careful algorithm and data organization. Whenever possible, restructure your problem so that each warp follows a uniform execution path. This might mean splitting the kernel to handle different cases in separate launches, rearranging the data so that each warp processes similar items, or pulling divergent conditions out of inner loops.
+
+简而言之，最小化 warp 分歧需要精心的算法与数据组织。只要可能，就重构你的问题，使每个 warp 遵循统一的执行路径。这可能意味着拆分核函数以在不同的启动中处理不同情形，重排数据使每个 warp 处理相似的元素，或把分歧条件从内层循环中提出来。
+
+When divergence is unavoidable (e.g., tree or graph workloads with inherently varying per-thread work), keep the divergent sections as short and infrequent as possible so that warps reconverge quickly. You can also leverage warp-level intrinsics like __any_sync, __ballot_sync, and other voting primitives to have threads agree on conditions together. You can also try to compact work into fewer lanes rather than branch all 32.
+
+当分歧不可避免时（例如树或图的工作负载，其每线程工作量本就参差不齐），要让分歧段尽可能短、尽可能少，以便 warp 快速重新收敛（reconvergence）。你也可以利用 warp 级内建函数，如 __any_sync、__ballot_sync 及其他投票原语，让线程共同就条件达成一致。你还可以尝试把工作压紧到更少的通道，而不是让全部 32 个线程分支。
+
+### Profiling and Detecting Warp Divergence
+
+### 剖析与检测 Warp 分歧
+
+Nsight Compute’s Source Counters and Warp State stats will pinpoint issues like divergent warps. You can detect these by looking for high Branch Divergence metric values or poorly coalesced loads that will show many replay or L2 cache miss events.
+
+Nsight Compute 的 Source Counters 与 Warp State 统计能精确定位诸如分歧 warp 之类的问题。你可以通过查找较高的 Branch Divergence 指标值、或未良好合并的加载（会显示大量 replay 或 L2 缓存缺失事件）来检测它们。
+
+Nsight Compute can also flag inefficiencies, including shared-memory bank conflicts and Tensor Core pipeline stalls. For example, if your kernel shows a high percentage of memory_throttle stalls, it might indicate that there is not enough memory-level parallelism for the GPUs, deep instruction pipelines. You can try increasing the number of independent memory accesses in flight—or use asynchronous copy instructions like cp.async and the CUDA Pipeline API (covered in Chapters 9 and 10)—to hide latency. A profiler will show symptoms of warp divergence in the form of low *warp execution efficiency*. This measures the average percentage of threads in a warp that are active. A warp execution efficiency of 30% means, on average, only 30% of the threads are doing useful work at any time. The rest were inactive due to divergence.
+
+Nsight Compute 还能标记出低效之处，包括共享内存 bank 冲突和 Tensor Core 流水线停顿。例如，如果你的核函数显示出较高比例的 memory_throttle 停顿，可能表明对 GPU 那深长的指令流水线而言内存级并行不足。你可以尝试增加在途（in-flight）的独立内存访问数量——或使用像 cp.async 这样的异步拷贝指令以及 CUDA Pipeline API（第 9、10 章介绍）——来隐藏延迟。剖析器会以较低的 *warp 执行效率*（warp execution efficiency）形式显示 warp 分歧的症状。该指标度量一个 warp 中活跃线程的平均百分比。warp 执行效率为 30% 意味着，在任意时刻平均只有 30% 的线程在做有用工作。其余线程因分歧而处于非活跃状态。
+
+When you profile a kernel with divergent branches, the profiler will flag a high percentage of *predicated-off* instructions. These are instructions that are fetched and issued but do no work because their lane mask is disabled. You’ll also see an inflated “dynamic instruction” count compared to the data you actually processed. Together, those two numbers tell you that every warp is walking down all sides of your conditionals in turn and serially.
+
+当你剖析一个含分歧分支的核函数时，剖析器会标记出较高比例的 *predicated-off*（被谓词关闭）指令。这些指令被取指并发射，但因其通道掩码被禁用而不做任何工作。你还会看到相比实际处理的数据量，“dynamic instruction”（动态指令）计数被抬高。这两个数字合在一起告诉你：每个 warp 都在逐一、串行地走遍条件语句的所有分支。
+
+For instance, one subset of threads, or *lanes*, executes path A while the rest of the threads sit idle. Subsequently, the idle threads become active threads and execute path B. The result is a doubling of your instruction traffic and a serious reduction in your warp’s effective throughput, or goodput, since each inactive set of threads still fetches and issues instructions—even though they’re masked out.
+
+例如，一个线程子集，或称通道（lane），执行路径 A，而其余线程空闲。随后，空闲线程变为活跃线程并执行路径 B。结果是指令流量翻倍，且 warp 的有效吞吐，即有效吞吐（goodput），严重下降，因为每一组非活跃线程仍会取指并发射指令——即便它们被掩蔽掉了。
+
+This is somewhat easy to spot in source code, as any per-thread conditional, whether it’s a threshold check, a sparse‐data loop, or a data-dependent filter, will trigger this serialized, repeated execution. To reclaim performance, you must eliminate or flatten those divergent branches.
+
+这在源代码中相对容易发现，因为任何逐线程的条件判断——无论是阈值检查、稀疏数据循环，还是数据相关的过滤——都会触发这种串行化的重复执行。要夺回性能，你必须消除或压平这些分歧分支。
+
+You can make the condition uniform across the warp, pull it out of tight loops, or replace it with arithmetic or lookup‐table techniques so that all 32 threads execute the same instruction stream and perform useful work. Let’s look at an example to make things clearer.
+
+你可以让条件在整个 warp 内保持一致、把它从紧凑循环中提出来，或用算术或查找表技巧取而代之，从而让全部 32 个线程执行相同的指令流并做有用工作。让我们看一个例子把问题讲清楚。
+
+If you see low warp execution efficiency, inspect your kernel’s branches. It may be beneficial to refactor conditional logic into separate kernels or use warp-level primitives (e.g., ballot sync) to handle divergence more efficiently, as we’ll cover next.
+
+如果你看到较低的 warp 执行效率，就检查核函数的分支。把条件逻辑重构进单独的核函数、或使用 warp 级原语（例如 ballot sync）来更高效地处理分歧，可能是有益的，接下来我们就会介绍。
+
+### Using Predication to Minimize Divergence
+
+### 使用谓词化最小化分歧
+
+Let’s show an example using predication to profile and eliminate warp divergence and branches. Consider a kernel that thresholds an array using if (x[i] > 0) y[i] = x[i]; else y[i] = 0;.
+
+让我们用一个例子来展示如何借助谓词化剖析并消除 warp 分歧与分支。考虑一个用 if (x[i] > 0) y[i] = x[i]; else y[i] = 0; 对数组做阈值处理的核函数。
+
+If half the values are positive and half are not, then most warps will have some threads take the if branch and some take the else branch. The warp will first execute the if branch instructions for the threads when the condition is true. It will simply mask out the other threads. It then runs again and executes the else branch for the remaining threads. So this took two sets of instructions to accomplish one logical set of operations. This decreases efficiency by 50%.
+
+如果半数值为正、半数不为正，那么大多数 warp 都会有一些线程走 if 分支、另一些走 else 分支。warp 会先为条件为真的线程执行 if 分支的指令，直接把其他线程掩蔽掉。然后再次运行，为剩余线程执行 else 分支。于是完成一组逻辑操作用了两组指令。这把效率降低了 50%。
+
+*Before example (CUDA C++).* In this example, if some threads in a warp satisfy X[i] > threshold and others do not, the warp will diverge. This is a clear example of a kernel that will cause warp branch divergence:
+
+*前置示例（CUDA C++）。* 在这个例子中，如果一个 warp 中的部分线程满足 X[i] > threshold 而另一些不满足，该 warp 就会分歧。这是一个会导致 warp 分支分歧的核函数的明确例子：
+
+```
+// threshold_naive.cu
+__global__ void threshold_naive(const float* X, float* Y,
+                                float threshold, int N) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < N) {
+        if (X[i] > threshold) {
+            Y[i] = X[i];    // branch 1
+        } else {
+            Y[i] = 0.0f;    // branch 2
+        }
+    }
+}
+```
+
+```
+// threshold_naive.cu
+__global__ void threshold_naive(const float* X, float* Y,
+                                float threshold, int N) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < N) {
+        if (X[i] > threshold) {
+            Y[i] = X[i];    // 分支 1
+        } else {
+            Y[i] = 0.0f;    // 分支 2
+        }
+    }
+}
+```
+
+This results in executing the warp twice, one after another in serial. One execution will run with the assignment Y[i]=X[i] for one subset of threads, and the other execution will run with Y[i]=0 for the other subset of threads. The warp execution efficiency will be low—approximately 50% if half of the threads take each path.
+
+这会导致该 warp 被执行两次，一次接一次地串行进行。一次执行为一个线程子集运行赋值 Y[i]=X[i]，另一次执行为另一个线程子集运行 Y[i]=0。warp 执行效率会很低——如果两条路径各占一半线程，则约为 50%。
+
+*After example (CUDA C++).* Here is a divergence-reduced approach using predication. In this version, we use the ternary operator, which the compiler is likely to translate into a predicated move instruction (SEL/MOV based on condition) rather than an actual branch:
+
+*后置示例（CUDA C++）。* 下面是一种使用谓词化来减少分歧的方法。在这个版本中，我们使用三元运算符，编译器很可能会把它翻译成一条谓词化的传送指令（基于条件的 SEL/MOV），而不是真正的分支：
+
+```
+// threshold_predicated.cu
+__global__ void threshold_predicated(const float* X, float* Y,
+                                     float threshold, int N) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < N) {
+        float x = X[i];
+        // Use a conditional move or multiplication by boolean
+        float val = (x > threshold) ? x : 0.0f;
+        Y[i] = val;
+    }
+}
+```
+
+```
+// threshold_predicated.cu
+__global__ void threshold_predicated(const float* X, float* Y,
+                                     float threshold, int N) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < N) {
+        float x = X[i];
+        // 使用条件传送或乘以布尔值
+        float val = (x > threshold) ? x : 0.0f;
+        Y[i] = val;
+    }
+}
+```
+
+In this case, all threads execute the same instruction sequence of computing val, then storing it. This avoids warp divergence because the control flow is uniform across the warp. But threads for which the condition is false will just set val=0. The result is that warp execution efficiency stays high since all threads follow one path.
+
+在这种情况下，所有线程执行相同的指令序列：先计算 val，再存储它。这避免了 warp 分歧，因为控制流在整个 warp 内是一致的。而条件为假的线程只是把 val 置为 0。结果是 warp 执行效率保持很高，因为所有线程遵循同一条路径。
+
+> In simple cases, the CUDA NVCC compiler likely generated a predicated move for the ternary operator, as expected. In PTX/assembly, you would see the PTX @p predicate syntax to guard the write without splitting into separate warp paths.
+
+> 在简单情形下，CUDA NVCC 编译器很可能如预期地为三元运算符生成了一条谓词化传送指令。在 PTX/汇编中，你会看到 PTX 的 @p 谓词语法来守护写操作，而无需分裂成独立的 warp 路径。
+
+*After example (PyTorch).* In PyTorch, the threshold operation can be done with vectorized operations as follows:
+
+*后置示例（PyTorch）。* 在 PyTorch 中，阈值操作可以用向量化操作完成，如下所示：
+
+```
+# threshold_op.py
+import torch
+
+X = torch.randn(N, device='cuda')
+Y = torch.maximum(X, torch.zeros_like(X))  # equivalent to Y = X > 0 ? X : 0
+torch.cuda.synchronize()
+```
+
+```
+# threshold_op.py
+import torch
+
+X = torch.randn(N, device='cuda')
+Y = torch.maximum(X, torch.zeros_like(X))  # 等价于 Y = X > 0 ? X : 0
+torch.cuda.synchronize()
+```
+
+The torch.maximum with 0 will execute on the GPU without branching since it uses elementwise max, which is implemented in a vectorized manner. Libraries like PyTorch ensure these elementwise ops are divergence-free at the warp level by using predication or bitwise tricks under the hood:
+
+torch.maximum 与 0 求最大值会在 GPU 上无分支地执行，因为它使用逐元素 max，这是以向量化方式实现的。像 PyTorch 这样的库通过在底层使用谓词化或位运算技巧，确保这些逐元素操作在 warp 级别是无分歧的：
+
+```
+# jit_threshold_op.py
+import torch
+
+# In PyTorch, we can compile and fuse this operation
+# for even higher throughput
+@torch.compile()
+def threshold_op(X):
+    return torch.maximum(X, torch.zeros_like(X))
+
+X = torch.randn(N, device='cuda')
+Y = threshold_op(X)
+torch.cuda.synchronize()
+```
+
+```
+# jit_threshold_op.py
+import torch
+
+# 在 PyTorch 中，我们可以编译并融合这一操作
+# 以获得更高的吞吐
+@torch.compile()
+def threshold_op(X):
+    return torch.maximum(X, torch.zeros_like(X))
+
+X = torch.randn(N, device='cuda')
+Y = threshold_op(X)
+torch.cuda.synchronize()
+```
+
+> As you will see in Chapters 13 and 14, torch.compile uses TorchInductor to fuse many pointwise operations into kernels, which better match the performance of the manual CUDA C++ example. However, torch.compile does not guarantee optimal occupancy or ILP, so you may still need to profile and tune performance further.
+
+> 正如你将在第 13、14 章看到的，torch.compile 使用 TorchInductor 把许多逐点操作融合进核函数，从而更好地匹配手写 CUDA C++ 示例的性能。然而，torch.compile 并不保证最优的占用率或 ILP，因此你可能仍需进一步剖析并调优性能。
+
+Under the hood, these types of elementwise functions compile down to single-instruction, multiple data (SIMD)‐style predication or bitwise select operations on GPUs. This ensures that every thread in a warp follows the same instruction stream and avoids the serialization penalties of divergent control flow.
+
+在底层，这类逐元素函数会在 GPU 上编译为单指令多数据（SIMD）风格的谓词化或位选择操作。这确保一个 warp 中的每个线程都遵循相同的指令流，避免了分歧控制流的串行化惩罚。
+
+Overall, reducing warp divergence improves the warp’s efficiency and yields substantial speedups in which divergence was a major issue. Table 8-3 shows the results of reducing warp divergence by replacing branches with predicated operations.
+
+总体而言，减少 warp 分歧能提升 warp 的效率，并在分歧本是主要问题的场景中带来可观的加速。表 8-3 展示了用谓词化操作替换分支来减少 warp 分歧的结果。
+
+Table 8-3. Profiling results of removing warp divergence
+
+表 8-3. 消除 warp 分歧的剖析结果
+
+| Metric | Before | After |
+| --- | --- | --- |
+| Kernel execution time | 30 ms | 15 ms (–50%) |
+| Dynamic instruction count | 600 M instructions | 300 M instructions (–50%) |
+| Average warp branch-resolving stall latency | 200 cycles | 100 cycles (–50%) |
+| Warp execution efficiency | 50% | 99% |
+| Predicated-off threads (%) | 50% | 0% |
+
+| 指标 | 之前 | 之后 |
+| --- | --- | --- |
+| 核函数执行时间 | 30 ms | 15 ms (–50%) |
+| 动态指令计数 | 600 M instructions | 300 M instructions (–50%) |
+| 平均 warp 分支解析停顿延迟 | 200 cycles | 100 cycles (–50%) |
+| warp 执行效率 | 50% | 99% |
+| 被谓词关闭的线程占比 | 50% | 0% |
+
+> Note: The numeric values in all metrics tables are illustrative to explain the concepts. For actual benchmark results on different GPU architectures, see the GitHub repository.
+
+> 注：所有指标表格中的数值均为示意性的，用于解释概念。不同 GPU 架构上的实际基准结果，请参见 GitHub 仓库。
+
+By replacing the two‐path branches with a single predicated max() operation, we saw dramatic improvements across all key Nsight Compute metrics. The kernel execution time measured by gpu__time_elapsed.avg dropped from 30 ms to 15 ms, effectively doubling throughput.
+
+通过用单条谓词化的 max() 操作替换双路径分支，我们在所有关键的 Nsight Compute 指标上都看到了显著改善。由 gpu__time_elapsed.avg 度量的核函数执行时间从 30 ms 降到 15 ms，实际上使吞吐翻倍。
+
+Warp execution efficiency climbed to nearly 100% since all threads in each warp stayed active with useful work. And the profiler further reports a 0% predicated-off ratio, indicating that no lanes were ever masked off under the predicated max() approach. This confirms that nearly all reconvergence overhead has been eliminated.
+
+warp 执行效率攀升至接近 100%，因为每个 warp 中的所有线程都保持活跃并做有用工作。剖析器进一步报告 0% 的被谓词关闭比例，表明在谓词化 max() 方法下从未有任何通道被掩蔽。这证实了几乎所有重新收敛的开销都已被消除。
+
+At the same time, the dynamic instruction count (smsp__inst_executed.sum) dropped by 50% from 600 million to 300 million instructions, since each warp no longer spent cycles executing both sides of the branch serially. The average warp branch-resolving stall latency (smsp__average_warp_latency_issue_stalled_branch_resolving) also halved, from 200 cycles down to 100 cycles.
+
+同时，动态指令计数（smsp__inst_executed.sum）下降了 50%，从 6 亿降到 3 亿条指令，因为每个 warp 不再花周期去串行执行分支的两侧。平均 warp 分支解析停顿延迟（smsp__average_warp_latency_issue_stalled_branch_resolving）也减半，从 200 cycles 降到 100 cycles。
+
+> If your kernel contains multiple divergence points or if each divergent branch carries heavier work, removing those branches can compound these gains—potentially yielding more than a 2× speedup per branch eliminated.
+
+> 如果你的核函数包含多个分歧点，或者每个分歧分支承载更繁重的工作，那么消除这些分支能让上述收益叠加——每消除一个分支就有可能带来超过 2× 的加速。
+
+Note that predication isn’t free. Some threads still compute values (e.g., val = x) and their results are never used. If each branch carries substantial work, computing both sides for every thread can actually cost more than a mild divergence.
+
+请注意，谓词化并非没有代价。有些线程仍会计算值（例如 val = x），而其结果从未被使用。如果每条分支承载可观的工作，为每个线程都计算两侧实际上可能比轻度分歧代价更高。
+
+In simple cases like our threshold example, predication wins, but you should always benchmark. Try both branch-based and predicated versions under Nsight Compute’s warp execution efficiency metric. If efficiency is low and each branch is light, predication will likely help. If a branch is heavy, allowing some divergence—or using a separate kernel—may be the better path. Ultimately, minimizing divergence is crucial for SIMT performance, so structure your algorithms to keep warps on a single path when possible, and isolate any remaining divergent logic into its own kernel or warp-sized region.
+
+在像我们的阈值例子这样的简单情形中，谓词化胜出，但你始终应做基准测试。在 Nsight Compute 的 warp 执行效率指标下同时试验基于分支和谓词化的两个版本。如果效率低且每条分支都很轻，谓词化很可能有帮助。如果分支很重，允许一些分歧——或使用单独的核函数——可能是更好的路径。归根结底，最小化分歧对 SIMT 性能至关重要，因此在可能时构造你的算法让 warp 保持在单一路径上，并把任何残余的分歧逻辑隔离进它自己的核函数或 warp 大小的区域中。
+
+> CUDA compilers will often apply simple predication automatically for you, but it’s still worth hand-tuning and profiling for performance-critical kernels.
+
+> CUDA 编译器往往会自动为你应用简单的谓词化，但对性能关键的核函数，仍值得手工调优和剖析。
+
+### Efficient Intrawarp Communication with Warp Intrinsics
+
+### 使用 Warp 内建函数实现高效的 Warp 内通信
+
+When threads within a warp must share data to compute a reduction/aggregation, for instance, you can use warp shuffle intrinsics, including __shfl_sync and __shfl_down_sync (introduced in Chapter 6) to exchange values directly through registers. This is in contrast to staging them in shared memory and calling __syncthreads(), which negatively impacts performance.
+
+例如，当一个 warp 内的线程必须共享数据以计算归约/聚合时，你可以使用 warp shuffle 内建函数，包括 __shfl_sync 和 __shfl_down_sync（第 6 章已介绍），直接通过寄存器交换数值。这与把它们暂存到共享内存并调用 __syncthreads() 形成对比，后者会对性能产生负面影响。
+
+Unlike the shared memory approach that generates extra L1/L2 traffic and requires a full-block barrier, shuffles move data only between registers and implicitly synchronize the 32 lanes in a warp at each instruction. This adds only a few clock cycles of latency.
+
+不同于会产生额外 L1/L2 流量并需要整块屏障的共享内存方法，shuffle 只在寄存器之间移动数据，并在每条指令处隐式同步一个 warp 的 32 个通道。这只增加寥寥几个时钟周期的延迟。
+
+For a full discussion, including performance comparisons, code examples, and how to implement warp-level reductions or prefix sums, see Chapter 6. If your cooperation spans multiple warps, you must still use block-level or grid-level synchronization (e.g., __syncthreads()) or use cooperative groups (covered in Chapter 10.) But for purely intrawarp communication, shuffles are almost always the fastest choice.
+
+关于完整讨论，包括性能对比、代码示例，以及如何实现 warp 级归约或前缀和，请参见第 6 章。如果你的协作跨越多个 warp，你仍必须使用块级或网格级同步（例如 __syncthreads()）或使用协作组（第 10 章介绍）。但对于纯粹的 warp 内通信，shuffle 几乎总是最快的选择。
+
+In short, if your algorithm requires threads in the same warp to share intermediate results or coordinate on a computation, reach for __shfl_sync and related warp-level options. Only use block-level shared memory and __syncthreads() if the cooperation truly spans multiple warps.
+
+简而言之，如果你的算法要求同一 warp 中的线程共享中间结果或在某项计算上协同，就动用 __shfl_sync 及相关的 warp 级选项。只有当协作确实跨越多个 warp 时，才使用块级共享内存和 __syncthreads()。
+
+### PyTorch Considerations for Warp-Level Efficiency
+
+### 面向 Warp 级效率的 PyTorch 考量
+
+At the pure Python level, PyTorch doesn’t expose warp intrinsics or allow you to directly control warp-level execution. However, as an end user of PyTorch, you indirectly benefit from these optimizations because many of PyTorch’s internal CUDA kernels use warp-level tricks.
+
+在纯 Python 层面，PyTorch 不暴露 warp 内建函数，也不允许你直接控制 warp 级执行。然而，作为 PyTorch 的最终用户，你会间接受益于这些优化，因为 PyTorch 的许多内部 CUDA 核函数都使用了 warp 级技巧。
+
+For instance, the implementation of torch.sum(x, dim=0), which sums across a dimension of a tensor, will often use warp-level reductions when the dimension being reduced is small (e.g., within 32 elements). In such cases, each warp of threads cooperates using shuffle instructions to produce a partial sum without diverging or using shared memory. This logic is implemented inside the library so that you don’t have to implement it yourself.
+
+例如，torch.sum(x, dim=0) 的实现——它沿张量的某个维度求和——在被归约的维度较小时（例如在 32 个元素以内）往往会使用 warp 级归约。在这种情形下，每个线程 warp 使用 shuffle 指令协同，产生一个部分和，而无需分歧或使用共享内存。这套逻辑在库内部实现，因此你不必自己实现。
+
+If you write a custom CUDA kernel as a PyTorch extension, you can—and should—use these warp-level optimizations in your device code when possible. For instance, if your operation requires summing values within a warp or exchanging data between threads, prefer using intrinsics like __shfl_sync over naive shared memory approaches to increase speed and reduce overhead. Also be mindful of warp divergence in any custom CUDA code.
+
+如果你把自定义 CUDA 核函数作为 PyTorch 扩展来编写，你可以——而且应该——在可能时在你的设备代码中使用这些 warp 级优化。例如，如果你的操作需要在一个 warp 内对数值求和或在线程间交换数据，请优先使用 __shfl_sync 之类的内建函数，而非朴素的共享内存方法，以提升速度并减少开销。也要留意任何自定义 CUDA 代码中的 warp 分歧。
+
+And if you find yourself using if statements per element, you can instead express the condition as a tensor-level operation using torch.where, for instance, on the whole tensor. This allows the library to handle the condition more efficiently—likely in a vectorized and warp-coherent way.
+
+而如果你发现自己在逐元素地使用 if 语句，你可以改为把条件表达为张量级操作，例如对整个张量使用 torch.where。这让库能更高效地处理条件——很可能以向量化且 warp 一致的方式。
+
+PyTorch’s JIT compiler and graph executor, discussed in Chapter 10, can fuse elementwise operations. This increases warp efficiency and arithmetic intensity by doing more work per kernel—and more work per byte of memory moved.
+
+第 10 章讨论的 PyTorch JIT 编译器和图执行器可以融合逐元素操作。这通过在每个核函数中做更多工作——以及为每移动一字节内存做更多工作——来提升 warp 效率和算术强度。
+
+When multiple operations are fused into one kernel, a warp processes more work in a single pass. While kernel fusion can’t magically eliminate divergence inherent in the algorithm, it does mean that each warp does more useful work. As such, any divergence overhead is amortized over more computations.
+
+当多个操作被融合进一个核函数时，一个 warp 在单趟中处理更多工作。虽然核函数融合无法神奇地消除算法固有的分歧，但它确实意味着每个 warp 做更多有用工作。因此，任何分歧开销都被摊薄到更多的计算上。
+
+For example, if you have a rectified linear unit (ReLU) operation followed by an abs() operation, a fused kernel could handle both in one pass. So even if there’s a branch, it’s handling the two operations together per warp.
+
+例如，如果你有一个修正线性单元（ReLU）操作，其后跟一个 abs() 操作，一个融合核函数可以在一趟中处理二者。所以即便存在分支，它也是按 warp 一并处理这两个操作。
+
+As a CUDA programmer, you should avoid intrawarp divergence and use warp intrinsics for any collective operations within a warp. This ensures all 32 threads in the warp stay busy doing useful work in parallel.
+
+作为 CUDA 程序员，你应避免 warp 内分歧，并对 warp 内的任何集体操作使用 warp 内建函数。这确保 warp 中的全部 32 个线程都忙于并行地做有用工作。
+
+As a PyTorch user, be aware that the library is already doing this for you under the hood. Your role is to write your computations in a way that allows these optimizations to be utilized. For instance, use built-in tensor operations (optimized with CUDA C++) instead of writing explicit Python loops with per-element conditionals. If you are using custom CUDA extensions, apply the same best practices we’ve discussed.
+
+作为 PyTorch 用户，要意识到库已经在底层为你做了这些。你的职责是以一种能让这些优化被利用的方式来编写你的计算。例如，使用内置的张量操作（以 CUDA C++ 优化过），而不是编写带有逐元素条件的显式 Python 循环。如果你在使用自定义 CUDA 扩展，请应用我们讨论过的同样的最佳实践。
+
+Each warp’s 32 lanes working in unison is the ideal. By minimizing divergence and using fast intrinsics for any needed communication, you ensure warp execution efficiency. These techniques often yield a modest, but meaningful, speedup—perhaps a 1.1× to 1.3× improvement. This can be significant in a tight kernel.
+
+每个 warp 的 32 个通道齐步协同是理想状态。通过最小化分歧、并对任何需要的通信使用快速内建函数，你就能确保 warp 执行效率。这些技巧往往带来适度但有意义的加速——也许是 1.1× 到 1.3× 的改善。这在一个紧凑的核函数中可能相当可观。
+
+These optimizations also set the stage for instruction-level parallelism, which allows each thread to do more useful work. Let’s cover this next.
+
+这些优化也为指令级并行铺平了道路，后者让每个线程做更多有用工作。接下来我们就来介绍它。
+
+## Exposing Instruction-Level Parallelism
+
+## 暴露指令级并行
+
+As we saw in the occupancy discussion, running many warps concurrently lets the SM’s scheduler switch away from any warp that stalls on a long‐latency operation such as a global‐memory load. In addition to launching enough threads, we can also exploit ILP within each warp so that a single warp does not need to wait for one instruction to complete before issuing the next.
+
+正如我们在占用率讨论中所见，并发运行许多 warp 可以让 SM 的调度器从任何因长延迟操作（例如全局内存加载）而停顿的 warp 切走。除了启动足够多的线程之外，我们还可以在每个 warp 内部利用 ILP，使单个 warp 无需等待一条指令完成后再发射下一条。
+
+You can rearrange or unroll your code so that each thread issues multiple independent operations (e.g., memory loads and arithmetic instructions) before consuming their results. This way, the GPU keeps its execution units busy while earlier instructions are still pending.
+
+你可以重排或展开你的代码，使每个线程在消费结果之前发射多条独立操作（例如内存加载和算术指令）。这样，当较早的指令仍在挂起时，GPU 让它的执行单元保持忙碌。
+
+Leveraging ILP allows a single warp to issue certain independent instructions back-to-back, which improves latency hiding. For instance, a thread might load data and then perform unrelated arithmetic while waiting for that load to complete. Figure 8-8 shows an example of multiple instructions overlapping during each cycle.
+
+利用 ILP 让单个 warp 能背靠背地发射某些独立指令，从而改善延迟隐藏。例如，一个线程可能先加载数据，然后在等待该加载完成的同时执行不相关的算术。图 8-8 展示了每个周期中多条指令重叠的一个例子。
+
+![Figure 8-8. Overlapping with ILP](AI%20Systems%20Performance%20Engineering-ch8_images/figure-8-8.png)
+
+![图 8-8. ILP 带来的重叠](AI%20Systems%20Performance%20Engineering-ch8_images/figure-8-8.png)
+
+By unrolling your loop body, you turn what was once “load → multiply → store” each iteration into a sequence that loads and multiplies multiple elements before looping back. For example, instead of:
+
+通过展开循环体，你把原本每次迭代的“加载 → 相乘 → 存储”变成一个先加载并相乘多个元素、再循环回来的序列。例如，与其：
+
+```
+for (int i = 0; i < N; ++i) {
+
+    float ai = a[i];       // load
+    float bi = b[i];       // load
+    sum += ai * bi;        // multiply after both loads complete
+}
+```
+
+```
+for (int i = 0; i < N; ++i) {
+
+    float ai = a[i];       // 加载
+    float bi = b[i];       // 加载
+    sum += ai * bi;        // 在两次加载都完成后相乘
+}
+```
+
+You can unroll such that each loop iteration issues two independent multiply operations instead of one, as shown in the next code block. This gives the hardware an opportunity to execute the second multiply while the first multiply is still in progress—or while it’s waiting for its operands to load from memory.
+
+你可以展开，使每次循环迭代发射两条独立的乘法操作而非一条，如下一个代码块所示。这给了硬件一个机会：在第一条乘法仍在进行时——或在它仍等待操作数从内存加载时——执行第二条乘法。
+
+This properly overlaps and hides latency. The result is a higher instructions-per-cycle (IPC) and better latency hiding as shown below by computing the two multiplies, ai0*bi0 and ai1*bi1, in parallel:
+
+这恰当地重叠并隐藏了延迟。结果是更高的每周期指令数（IPC）和更好的延迟隐藏，如下所示，通过并行计算两条乘法 ai0*bi0 和 ai1*bi1：
+
+```
+for (int i = 0; i + 1 < N; i += 2) {
+    float ai0 = a[i];        // load a[i]
+    float bi0 = b[i];        // load b[i]
+    float ai1 = a[i + 1];    // load a[i+1]
+    float bi1 = b[i + 1];    // load b[i+1]
+    sum += ai0 * bi0 + ai1 * bi1;
+}
+```
+
+```
+for (int i = 0; i + 1 < N; i += 2) {
+    float ai0 = a[i];        // 加载 a[i]
+    float bi0 = b[i];        // 加载 b[i]
+    float ai1 = a[i + 1];    // 加载 a[i+1]
+    float bi1 = b[i + 1];    // 加载 b[i+1]
+    sum += ai0 * bi0 + ai1 * bi1;
+}
+```
+
+Here, we’re loading pairs of values (a[i], b[i] and a[i+1], b[i+1]) before doing any multiplies. Unrolling exposes two independent multiply instructions per loop iteration. This way, the GPU can overlap those arithmetic operations and hide the latency of each operand load.
+
+这里，我们在做任何乘法之前先成对加载数值（a[i]、b[i] 和 a[i+1]、b[i+1]）。展开使每次循环迭代暴露出两条独立的乘法指令。这样，GPU 就能重叠这些算术操作，并隐藏每次操作数加载的延迟。
+
+ILP does not directly change arithmetic intensity (FLOPS per byte). However, it raises overall throughput (FLOPS) by overlapping compute with memory or compute‐to‐compute dependencies. We explicitly unroll to increase independent work per thread and help dual-issue. In other words, ILP boosts throughput by time-multiplexing independent work—not by doing extra work.
+
+ILP 并不直接改变算术强度（每字节 FLOPS）。然而，它通过将计算与内存、或计算与计算之间的依赖相重叠，来提升整体吞吐（FLOPS）。我们显式地展开以增加每线程的独立工作并帮助双发射。换言之，ILP 通过对独立工作进行时间复用来提升吞吐——而不是靠做额外的工作。
+
+> A common misconception is that increasing ILP will perform more operations. However, it doesn’t—it just keeps the GPU’s multiple functional units busy. ILP helps only if your program has idle issue slots due to latency. If your kernel is already fully utilizing the execution units on every cycle (e.g., a tight compute-bound loop with no stalls), increasing ILP won’t actually increase performance.
+
+> 一个常见的误解是增加 ILP 会执行更多操作。然而并非如此——它只是让 GPU 的多个功能单元保持忙碌。ILP 只有在你的程序因延迟而存在空闲发射槽时才有帮助。如果你的核函数在每个周期都已充分利用执行单元（例如一个没有停顿的紧凑计算受限循环），增加 ILP 实际上不会提升性能。
+
+To encourage the compiler to increase, or expose, ILP, you can use #pragma unroll on short loops or tune -maxrregcount to allow the compiler to allocate more registers for holding intermediate values. This explicitly acknowledges that you want the compiler to increase register usage and potentially reduce occupancy.
+
+为鼓励编译器增加、或暴露 ILP，你可以在短循环上使用 #pragma unroll，或调优 -maxrregcount 以允许编译器分配更多寄存器来保存中间值。这明确表示你希望编译器增加寄存器用量，并可能因此降低占用率。
+
+In this way, ILP complements occupancy. High occupancy ensures there are many warps to switch to when one stalls, and ILP makes sure that a single warp can issue as many independent instructions as possible to fill the pipeline and hide latency. This is much like superscalar and out‐of‐order execution in CPUs, except it’s directed explicitly by the compiler’s scheduling of your CUDA code.
+
+如此，ILP 与占用率互补。高占用率确保当一个 warp 停顿时有许多 warp 可供切换，而 ILP 确保单个 warp 能发射尽可能多的独立指令来填满流水线并隐藏延迟。这很像 CPU 中的超标量（superscalar）与乱序执行（out-of-order execution），只不过它是由编译器对你的 CUDA 代码进行调度而显式引导的。
+
+### Warp Scheduling and Dual Issue Instructions
+
+### Warp 调度与双发射指令
+
+Each SM contains multiple warp schedulers. For example, Blackwell SMs have four warp schedulers. Each scheduler can issue up to two independent instructions per cycle, as shown in Figure 8-9.
+
+每个 SM 包含多个 warp 调度器。例如，Blackwell 的 SM 有四个 warp 调度器。每个调度器每周期可发射至多两条独立指令，如图 8-9 所示。
+
+![Figure 8-9. Each warp scheduler can dispatch up to two instructions per cycle called “dual issue”](AI%20Systems%20Performance%20Engineering-ch8_images/figure-8-9.png)
+
+![图 8-9. 每个 warp 调度器每周期可分派至多两条指令，称为“双发射”](AI%20Systems%20Performance%20Engineering-ch8_images/figure-8-9.png)
+
+In practice, this means that a single warp can overlap multiple independent operations across successive cycles—and sometimes even in the same cycle if they target different pipelines such as one math, one memory, or one special-function unit (SFU) pipeline. This means that multiple instructions can be in flight and progressing through the pipeline simultaneously. This overlap is the ILP that we discussed earlier.
+
+实践中，这意味着单个 warp 能在连续的周期间重叠多条独立操作——有时甚至在同一周期内，只要它们面向不同的流水线，例如一条数学、一条内存，或一条特殊功能单元（SFU）流水线。这意味着多条指令可以在途，并同时在流水线中推进。这种重叠就是我们前面讨论的 ILP。
+
+> On Blackwell, the FP32 and INT32 pipelines have been merged into a single set of unified CUDA cores. As such, they can only execute either FP32 or INT32 instructions in a given cycle—not both at once. Each core must pick one data type each cycle. As a result, any ILP that depended on dual-issuing an INT and an FP in the same cycle will no longer work since Blackwell must choose one or the other per cycle on each core. As such, mixed INT32 and FP32 instruction streams no longer benefit from dual issue on a single core. Mixed streams should instead exploit warp/SM concurrency —and not rely on per-core dual issue. As such, you should prefer dual issue with two independent math and memory instructions (or two independent math instructions such as FP32 and FP16) in flight using ILP. This will increase instruction-issue efficiency.
+
+> 在 Blackwell 上，FP32 和 INT32 流水线已被合并为一组统一 CUDA 核心（unified CUDA cores）。因此，它们在给定周期内只能执行 FP32 或 INT32 指令中的一种——而不能同时执行两者。每个核心每周期必须选择一种数据类型。结果是，任何依赖在同一周期内双发射一条 INT 和一条 FP 指令的 ILP 将不再奏效，因为在 Blackwell 上每个核心每周期都必须二者择一。因此，混合的 INT32 与 FP32 指令流在单个核心上不再从双发射受益。混合流应改为利用 warp/SM 并发——而不要依赖每核心的双发射。因此，你应优先让两条独立的数学与内存指令（或两条独立的数学指令，如 FP32 和 FP16）借助 ILP 在途进行双发射。这将提升指令发射效率。
+
+ILP does not require that two instructions physically fire in the same cycle. Instead, it makes sure that while one instruction (e.g., long-latency global memory load) is still pending, the warp can immediately issue another independent instruction (e.g., arithmetic operation) on the next cycle.
+
+ILP 并不要求两条指令在物理上于同一周期发火。相反，它确保当一条指令（例如长延迟的全局内存加载）仍在挂起时，warp 能在下一周期立即发射另一条独立指令（例如算术操作）。
+
+As a result of this overlap, by the time the data returns from memory, the arithmetic work has already made progress. This effectively hides the load’s latency. On Blackwell, multiple instructions can be in flight per warp due to pipelining, and the schedulers issue to different execution units over successive cycles. In practice, ILP appears as a steady stream of independent issues rather than a fixed number of concurrent instructions per warp.
+
+由于这种重叠，等到数据从内存返回时，算术工作已经取得了进展。这有效地隐藏了加载的延迟。在 Blackwell 上，由于流水线化，每个 warp 可以有多条指令在途，且调度器在连续的周期间向不同的执行单元发射。实践中，ILP 表现为一股稳定的独立发射流，而非每 warp 固定数量的并发指令。
+
+Consider a scenario in which each thread in your kernel loads two array elements—and then multiplies each by a different constant before combining the results. The multiply operation for the first element can execute while the second element’s load operation is still underway.
+
+考虑这样一个场景：你的核函数中每个线程加载两个数组元素——然后在合并结果之前，各自乘以一个不同的常量。第一个元素的乘法操作可以在第二个元素的加载操作仍在进行时执行。
+
+This overlapping pattern keeps the warps’ execution units busy instead of waiting. This raises overall throughput without changing how many loads and multiplies occur per element. Here is a concrete example of increasing ILP:
+
+这种重叠模式让 warp 的执行单元保持忙碌而非等待。这在不改变每个元素发生多少次加载和乘法的前提下提升整体吞吐。下面是一个增加 ILP 的具体例子：
+
+```
+// Launch configuration: e.g., 256 threads per block, enough blocks to cover N
+__global__ void independentOps(const float *a, const float *b,
+                               float *out, int N) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < N) {
+        float x = a[i];
+        float y = b[i];
+        // Two independent operations (no dependency between u and v):
+        float u = x * x;
+        float v = y * y;
+        // Dependent operation that uses both results:
+        float sum = u + v;
+        out[i] = sqrtf(sum);
+    }
+}
+```
+
+```
+// Launch configuration: e.g., 256 threads per block, enough blocks to cover N
+__global__ void independentOps(const float *a, const float *b,
+                               float *out, int N) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < N) {
+        float x = a[i];
+        float y = b[i];
+        // 两条独立操作（u 与 v 之间无依赖）：
+        float u = x * x;
+        float v = y * y;
+        // 使用两个结果的依赖操作：
+        float sum = u + v;
+        out[i] = sqrtf(sum);
+    }
+}
+```
+
+In this kernel, each thread loads two values x and y from different arrays and computes two results u and v. The calculations of u = x*x and v = y*y are independent of each other since neither uses the result of the other.
+
+在这个核函数中，每个线程从不同的数组加载两个值 x 和 y，并计算两个结果 u 和 v。u = x*x 与 v = y*y 的计算彼此独立，因为二者都不使用对方的结果。
+
+Structuring the code this way, instead of sum = x*x + y*y, gives the compiler an opportunity to arrange the instruction sequence to expose ILP and increase performance. Specifically, it can issue the instruction for u = x*x, then in the next cycle issue v = y*y before u has finished.
+
+以这种方式而非 sum = x*x + y*y 来构造代码，给了编译器一个机会去安排指令序列以暴露 ILP 并提升性能。具体来说，它可以先发射 u = x*x 的指令，然后在下一个周期于 u 完成之前发射 v = y*y。
+
+While the first multiplication is running—or waiting for a pipeline slot—the second one can run in parallel in another arithmetic unit. By the time it needs to do sum = u + v, likely both multiplications have been completed. The warp thus had multiple instructions in flight, which helps to hide the latency of those two multiply operations.
+
+在第一条乘法运行时——或等待流水线槽位时——第二条可以在另一个算术单元中并行运行。等到需要做 sum = u + v 时，两条乘法很可能都已完成。于是该 warp 就有多条指令在途，这有助于隐藏那两条乘法操作的延迟。
+
+In contrast, consider the code here in which v’s computation was placed after using u. In this scenario, we’d create an unnecessary dependency chain that limits ILP:
+
+相比之下，考虑下面这段代码，其中 v 的计算被放在了使用 u 之后。在这种情形下，我们会制造出一条不必要的依赖链，从而限制 ILP：
+
+```
+float u = x * x;
+float temp = u + 1.0f;    // some dependent use of u
+float v = y * y;
+...
+```
+
+```
+float u = x * x;
+float temp = u + 1.0f;    // some dependent use of u
+float v = y * y;
+...
+```
+
+The kernel computes u = x * x and immediately uses that result to form temp = u + 1.0f. Only *after* computing temp do you issue v = y * y, which does not depend on u or temp. Therefore, its placement after temp forces the GPU to wait until the u + 1.0f instruction finishes before it can issue the multiply for v.
+
+该核函数先计算 u = x * x，并立即用这个结果构造 temp = u + 1.0f。只有*在*算出 temp 之后，你才发射 v = y * y，而后者并不依赖 u 或 temp。因此，把它放在 temp 之后，会迫使 GPU 必须等到 u + 1.0f 指令完成后，才能发射 v 的乘法。
+
+In effect, you create a serial dependency chain: first x * x → u, then u + 1.0f → temp, and only then y * y → v. During the time the hardware is executing (or waiting for) the u + 1.0f operation, it cannot begin y * y even though v is mathematically independent. This ordering artificially limits instruction‐level parallelism because one independent multiply must park itself behind a dependent instruction.
+
+实际上，你制造出了一条串行依赖链：先是 x * x → u，然后 u + 1.0f → temp，最后才是 y * y → v。在硬件执行（或等待）u + 1.0f 操作期间，即便 v 在数学上是独立的，它也无法开始 y * y。这种排序人为地限制了指令级并行，因为一个独立的乘法不得不排在一条有依赖的指令后面。
+
+By contrast, consider the following reordered and optimized code:
+
+作为对比，考虑下面这段重新排序并优化后的代码：
+
+```
+// Optimized ordering with better ILP:
+
+float u = x * x;    // Independent multiply on x
+float v = y * y;    // Independent multiply on y (issues immediately after u)
+float temp = u + 1.0f;  // Only now use u
+// ... use v or temp as needed ...
+```
+
+```
+// Optimized ordering with better ILP:
+
+float u = x * x;    // Independent multiply on x
+float v = y * y;    // Independent multiply on y (issues immediately after u)
+float temp = u + 1.0f;  // Only now use u
+// ... use v or temp as needed ...
+```
+
+Here, we reordered the code such that both x * x and y * y occur back‐to‐back (i.e., float u = x * x; float v = y * y; float temp = u + 1.0f;). In this case, the GPU can issue the two independent multiplies in successive cycles without waiting for the u + 1.0f add to finish.
+
+这里，我们对代码进行了重排，使 x * x 与 y * y 背靠背地出现（即 float u = x * x; float v = y * y; float temp = u + 1.0f;）。这样一来，GPU 就可以在连续的周期里发射这两个独立的乘法，而无需等待 u + 1.0f 加法完成。
+
+This means that while the result of x * x may still be lingering in a “pending” pipeline slot, the hardware can already start executing y * y. Only once both of those multiplies have calculated their results does the GPU perform temp = u + 1.0f.
+
+这意味着，虽然 x * x 的结果可能还滞留在某个“待定”的流水线槽位中，硬件却已经可以开始执行 y * y。只有当这两个乘法都算出结果后，GPU 才执行 temp = u + 1.0f。
+
+In other words, you now have two multiplies in flight at once. This fills the execution units and hides latency. This improved ILP, issuing v = y * y as soon as possible, makes sure that the multiply on y overlaps with both the multiply on x and the later add—instead of being forced to wait. Consequently, the warp spends fewer cycles idle, which translates directly into higher throughput.
+
+换句话说，你现在同时有两个乘法在途。这填满了执行单元并隐藏了延迟。这种改进后的 ILP——尽早发射 v = y * y——确保 y 上的乘法与 x 上的乘法以及后面的加法都发生重叠，而不是被迫等待。因此，warp 处于空闲的周期更少，这直接转化为更高的吞吐。
+
+GPUs rely on the compiler, and sometimes the programmer’s hints, to schedule independent instructions. On modern CUDA compilers, simple patterns like the preceding are usually detected and scheduled optimally. But you can encourage ILP by structuring your code appropriately or using pragma compiler directives.
+
+GPU 依赖编译器（有时也依赖程序员的提示）来调度独立指令。在现代 CUDA 编译器上，像前面那样的简单模式通常都能被检测到并得到最优调度。但你可以通过恰当地组织代码或使用 pragma 编译器指令来促进 ILP。
+
+This example is simple, but it demonstrates the idea that you should not serialize independent work within a thread if you can help it. If a thread needs to load two arrays and do math on both, doing them in parallel, or interleaving them, is better than doing one after the other in a serial manner.
+
+这个例子很简单，但它说明了一个道理：只要有可能，就不要在一个线程内把独立的工作串行化。如果一个线程需要加载两个数组并对两者做运算，那么并行地做、或者交错地做，都优于串行地一个接一个地做。
+
+### ILP and Occupancy
+
+### ILP 与占用率
+
+On modern GPUs, the maximum resident warps per SM is 64 warps, or 2,048 threads (2,048 threads = 32 threads per warp × 64 warps). The warp schedulers can issue multiple instructions per cycle when dependencies permit. The INT32 and FP32 cores are unified and operate as either FP32 or INT32 in a given clock rather than both at once. The register file per SM is 256 KB, which is 64K 32-bit registers. This large register file is important for sustaining ILP without spilling, as we’ll see in a bit.
+
+在现代 GPU 上，每 SM 的最大驻留 warp 数为 64 warps，即 2,048 threads（2,048 threads = 每 warp 32 threads × 64 warps）。当依赖关系允许时，warp 调度器每周期可以发射多条指令。INT32 与 FP32 核心是统一的，在给定的一个时钟周期里要么作为 FP32、要么作为 INT32 运行，而不是同时兼任两者。每 SM 的寄存器堆为 256 KB，即 64K 个 32 位寄存器。这个大寄存器堆对于在不发生溢出的前提下维持 ILP 非常重要，稍后我们会看到这一点。
+
+If you write a kernel with little to no ILP such that each thread issues exactly one operation at a time, you typically need on the order of 1,536 active threads (~48 warps, or 75% occupancy) to saturate the SM’s execution units (these are not hard limits but rather approximations).
+
+如果你写的核函数几乎没有 ILP，以至于每个线程每次只发射一个操作，那么你通常需要大约 1,536 个活跃线程（约 48 warps，即 75% 占用率）才能让 SM 的执行单元饱和（这些并非硬性上限，而只是近似值）。
+
+By contrast, exposing even a modest amount of ILP can significantly lower the number of threads required. Table 8-4 summarizes how ILP reduces the threads/occupancy needed to saturate a Blackwell SM at different ILP values.
+
+相比之下，即使暴露少量的 ILP，也能显著降低所需的线程数。表 8-4 总结了在不同 ILP 值下，ILP 如何减少让一个 Blackwell SM 饱和所需的线程数/占用率。
+
+Table 8-4. How ILP reduces the threads/occupancy needed to saturate a Blackwell SM
+
+表 8-4. ILP 如何减少让一个 Blackwell SM 饱和所需的线程数/占用率
+
+| ILP (independent ops/thread) | Threads/SM for ~100% utilization | Occupancy (% of 2,048 threads) |
+| --- | --- | --- |
+| 1 (no ILP) | ~1,536 threads (48 warps) | 75% |
+| 2 | ~1,024 threads (32 warps) | 50% |
+| 3 | ~768 threads (24 warps) | 37.5% |
+| 4 | ~512 threads (16 warps) | 25% |
+
+| ILP（每线程独立操作数） | 达到约 100% 利用率所需的 Threads/SM | 占用率（占 2,048 threads 的百分比） |
+| --- | --- | --- |
+| 1（无 ILP） | ~1,536 threads (48 warps) | 75% |
+| 2 | ~1,024 threads (32 warps) | 50% |
+| 3 | ~768 threads (24 warps) | 37.5% |
+| 4 | ~512 threads (16 warps) | 25% |
+
+Here, two-way ILP, in which each thread issues two independent operations back-to-back, often achieves full throughput with roughly 1,024 active threads (≈32 warps, or 50% occupancy). This is because each warp keeps two operations in flight whenever one is still pending.
+
+其中，双路 ILP（two-way ILP，即每个线程背靠背发射两个独立操作）常常只需大约 1,024 个活跃线程（≈32 warps，即 50% 占用率）就能达到满吞吐。这是因为每个 warp 只要有一个操作仍在待定，就始终保持两个操作在途。
+
+Three-way ILP, on the other hand, can saturate with about 768 threads (≈24 warps, or 37.5% occupancy). A four-way ILP may need only 512 threads (≈16 warps, or 25% occupancy) to fill the pipelines. This is because each warp itself does the work of four independent operations.
+
+而三路 ILP 则可以用约 768 个线程（≈24 warps，即 37.5% 占用率）达到饱和。四路 ILP 可能只需 512 个线程（≈16 warps，即 25% 占用率）就能填满流水线。这是因为每个 warp 自身就完成了四个独立操作的工作量。
+
+> More in-flight operations per thread lets each warp keep the math pipelines busy—even at lower thread counts.
+
+> 每个线程在途的操作越多，每个 warp 就越能让数学流水线保持繁忙——即便在较低的线程数下也是如此。
+
+Clearly, increasing ILP lets you achieve peak compute throughput with fewer warps. This is especially valuable when your workload cannot launch huge numbers of threads—or when you want to free up on-chip resources for other tasks.
+
+显然，提高 ILP 让你能用更少的 warp 达到峰值计算吞吐。当你的工作负载无法启动海量线程时，或者当你想为其他任务腾出片上资源时，这一点尤其有价值。
+
+It’s important to note that there is a practical limit on how much ILP you can expose. Even though Blackwell SMs can keep many instructions in flight per warp, each warp can hold only a finite number of pending instructions.
+
+需要注意的是，你能暴露多少 ILP 是有实际上限的。尽管 Blackwell SM 可以让每个 warp 保持很多指令在途，但每个 warp 只能持有有限数量的待定指令。
+
+On top of that, the compiler must schedule independent instructions without exceeding the available registers or overwhelming the GPU’s instruction decode bandwidth. The decode bandwidth is the maximum number of instructions per cycle that the instruction‐fetch and decode hardware can push to execution units. Once you hit those limits, adding more independent operations produces diminishing returns.
+
+除此之外，编译器在调度独立指令时，不能超出可用的寄存器数量，也不能压垮 GPU 的指令译码带宽。译码带宽是指令取指与译码硬件每周期能向执行单元推送的最大指令数。一旦触及这些上限，再增加独立操作就会产生递减的收益。
+
+Once you have enough independent work to keep the issue slots and memory system busy, there is little practical benefit in increasing ILP further. Pushing to five-way or six-way ILP produces little gain and can even hurt performance due to the extra register pressure and instruction overhead.
+
+一旦你有足够的独立工作让发射槽和内存系统保持繁忙，进一步提高 ILP 就几乎没有实际好处了。推进到五路或六路 ILP 收益甚微，甚至会因额外的寄存器压力和指令开销而损害性能。
+
+> On Blackwell, the ideal ILP configuration is often between two and four independent operations per thread. At this point, its schedulers and caches are typically saturated. However, the exact point is kernel and workload dependent. Use Nsight Compute issue and stall metrics to decide where to stop.
+
+> 在 Blackwell 上，理想的 ILP 配置往往介于每线程两到四个独立操作之间。到了这个程度，它的调度器和缓存通常已经饱和。不过，确切的临界点取决于核函数和工作负载。请使用 Nsight Compute 的发射与停顿指标来判断该在何处停手。
+
+### Loop Unrolling, Interleaving, and Compiler Hinting
+
+### 循环展开、交错与编译器提示
+
+To exploit ILP in your own kernels, look for opportunities in which each thread issues multiple independent arithmetic or memory instructions before any one result is needed. Common patterns include the following:
+
+要在你自己的核函数中利用 ILP，就要寻找这样的机会：让每个线程在任何一个结果被需要之前，先发射多个独立的算术或内存指令。常见的模式包括以下几种：
+
+*Unrolling small loops* Unrolling loops allows each thread to perform *N* accumulations (e.g., 2× or 4×) with separate accumulator registers. For example, consider the following loop:
+
+*展开小循环* 展开循环让每个线程用各自独立的累加器寄存器执行 *N* 次累加（例如 2× 或 4×）。举例来说，考虑下面这个循环：
+
+```
+float sum = 0.0f;
+for (int k = 0; k < 4; ++k) {
+    float a = A[idx * 4 + k];
+    sum += a * w[k];  // dependent on load a
+}
+```
+
+```
+float sum = 0.0f;
+for (int k = 0; k < 4; ++k) {
+    float a = A[idx * 4 + k];
+    sum += a * w[k];  // dependent on load a
+}
+```
+
+You can rewrite this to take advantage of ILP, as shown next. This transformation creates four independent load-multiply pairs—one per a0..a3—that can be issued in rapid succession:
+
+你可以像下面这样重写它以利用 ILP。这次改写创造出四对独立的加载-乘法对——每个 a0..a3 各一对——它们可以快速接连发射：
+
+```
+float a0 = A[idx * 4 + 0];
+float a1 = A[idx * 4 + 1];
+float a2 = A[idx * 4 + 2];
+float a3 = A[idx * 4 + 3];
+float sum0 = a0 * w[0];
+float sum1 = a1 * w[1];
+float sum2 = a2 * w[2];
+float sum3 = a3 * w[3];
+float sum = sum0 + sum1 + sum2 + sum3;
+```
+
+```
+float a0 = A[idx * 4 + 0];
+float a1 = A[idx * 4 + 1];
+float a2 = A[idx * 4 + 2];
+float a3 = A[idx * 4 + 3];
+float sum0 = a0 * w[0];
+float sum1 = a1 * w[1];
+float sum2 = a2 * w[2];
+float sum3 = a3 * w[3];
+float sum = sum0 + sum1 + sum2 + sum3;
+```
+
+Here, all four loads are issued first. As each load completes, its corresponding multiply can execute and overlap subsequent loads with computations to hide the latency of the memory load. In other words, the GPU interleaves these operations such that while one pair is waiting on memory, another pair can be multiplying. This increases ILP and hides latency.
+
+这里，四个加载先全部发射。随着每个加载完成，其对应的乘法便可以执行，并让后续的加载与计算相互重叠，从而隐藏内存加载的延迟。换句话说，GPU 交错执行这些操作，使得当一对操作在等待内存时，另一对可以正在做乘法。这提高了 ILP 并隐藏了延迟。
+
+*Interleaving independent operations* You can interleave operations that use different data elements, as shown here:
+
+*交错独立操作* 你可以交错那些使用不同数据元素的操作，如下所示：
+
+```
+float x = A[idx];
+float y = B[idx];
+// If you wrote float u = x * c; then float v = y * d;,
+// the multiplies are independent.
+float u = x * c;  // can start as soon as x is ready
+float v = y * d;  // can start as soon as y is ready, overlapping with u
+```
+
+```
+float x = A[idx];
+float y = B[idx];
+// If you wrote float u = x * c; then float v = y * d;,
+// the multiplies are independent.
+float u = x * c;  // can start as soon as x is ready
+float v = y * d;  // can start as soon as y is ready, overlapping with u
+```
+
+Here, you keep the execution units busy on every cycle by not letting one dependent instruction block the next independent instruction, etc. In this interleaved code, u = x*c and v = y*d are independent instructions and can be executed concurrently. The compiler will schedule them back-to-back such that one multiply can proceed while the other multiply is still completing. This is ILP in action.
+
+这里，你通过不让一条有依赖的指令阻塞下一条独立指令等方式，让执行单元每个周期都保持繁忙。在这段交错的代码中，u = x*c 与 v = y*d 是彼此独立的指令，可以并发执行。编译器会把它们背靠背地调度，使得一个乘法可以在另一个乘法尚未完成时继续推进。这就是 ILP 的实际运作。
+
+*Using compiler hints* Compiler hints such as #pragma unroll on small loops can help the compiler explicitly create multiple arithmetic chains. If needed, you can adjust -maxrregcount to allow the compiler to use more registers per thread for the unrolled variables. By allowing more resources per thread, you are increasing ILP at the cost of fewer threads. This naturally trades off some occupancy for higher ILP.
+
+*使用编译器提示* 像在小循环上使用 #pragma unroll 这样的编译器提示，可以帮助编译器显式地创建多条算术链。如有需要，你可以调整 -maxrregcount，允许编译器为展开后的变量给每个线程使用更多寄存器。通过允许每线程使用更多资源，你是在以更少的线程为代价换取更高的 ILP。这自然是在用一部分占用率换取更高的 ILP。
+
+In short, to hide latency and maximize throughput on Blackwell’s deep pipelines, you should combine high occupancy (e.g., enough warps/threads to hide stalls) with high ILP (e.g., multiple independent instructions per thread). Here, you make sure that even when one instruction is waiting (e.g., memory load or long-latency arithmetic), the warp can issue other instructions immediately. This will significantly increase the kernel’s achieved FLOPS.
+
+简而言之，要在 Blackwell 的深流水线上隐藏延迟并最大化吞吐，你应当把高占用率（例如足够的 warp/线程数来隐藏停顿）与高 ILP（例如每线程多条独立指令）结合起来。这样，你就能确保即使一条指令正在等待（例如内存加载或长延迟算术），warp 也能立即发射其他指令。这将显著提高核函数的实测 FLOPS。
+
+> On large unrolls, watch instruction-fetch and issue stalls in Nsight Compute. Excessive unrolling can bloat code size—or saturate decode and dispatch—without further throughput gains.
+
+> 在大规模展开时，请留意 Nsight Compute 中的取指与发射停顿。过度展开会使代码体积膨胀——或使译码和分发饱和——却带不来进一步的吞吐提升。
+
+### Profiling and Mitigating Register Pressure
+
+### 剖析并缓解寄存器压力
+
+However, be mindful of register pressure since ILP typically requires more registers to hold multiple independent values and results. If you unroll too much—or add too many parallel computations—you might increase register usage to the point that occupancy falls significantly. As always, finding the right balance is key.
+
+不过，要留意寄存器压力，因为 ILP 通常需要更多寄存器来保存多个独立的值和结果。如果你展开得太多——或添加了过多的并行计算——你可能会把寄存器用量增加到占用率显著下降的地步。一如既往，找到恰当的平衡才是关键。
+
+The CUDA compiler does a good job of unrolling loops automatically. But if you push ILP too far by manually unrolling too many iterations using #pragma unroll, for instance, you may notice that occupancy drops.
+
+CUDA 编译器在自动展开循环方面做得很好。但如果你把 ILP 推得太远，例如用 #pragma unroll 手动展开过多的迭代，你可能会发现占用率下降了。
+
+In this case, Nsight Compute will show “Limited by Registers” within its Occupancy analysis. This is usually a clear signal that you’ve gone too far. If you see this, you should dial back the unrolling, reduce the number of independent accumulator variables, or relax your launch bounds. Specifically, you can reduce the required MinBlocksPerSM or increase MaxThreadsPerBlock so that each block can use more registers without spilling. In other words, allow a bit lower occupancy to avoid severe spilling. This way the register pressure eases and occupancy is recovered.
+
+在这种情况下，Nsight Compute 会在其占用率分析中显示“Limited by Registers”。这通常是一个明确的信号，说明你做过头了。如果看到这个提示，你应当收敛展开程度、减少独立累加器变量的数量，或放宽你的启动界限。具体来说，你可以降低所需的 MinBlocksPerSM，或提高 MaxThreadsPerBlock，使每个块能在不溢出的前提下使用更多寄存器。换句话说，允许占用率稍微低一些，以避免严重的溢出。这样一来，寄存器压力得到缓解，占用率也随之恢复。
+
+From a profiling perspective, if ILP is helping, you should see the “Stall: Exec Dependency” percentage drop since warps are spending less time waiting on prior instructions. And you should see higher instructions per cycle.
+
+从剖析的角度看，如果 ILP 起了作用，你应当看到“Stall: Exec Dependency”的百分比下降，因为 warp 花在等待前序指令上的时间更少了。而且你应当看到更高的每周期指令数。
+
+Nsight Compute reports an *Issue Efficiency* or *IPC* metric. This should rise as ILP increases. For example, you should see the issue efficiency or instructions-per-cycle metric rise as you increase ILP. For example, if you see the IPC metric increase from 1.0 to 1.8 per warp scheduler when you unroll, this indicates that the warp is now issuing close to two instructions per cycle on average instead of just one. However, the actual values depend on the instruction mix and the architecture scheduling constraints.
+
+Nsight Compute 会报告一个 *Issue Efficiency*（发射效率）或 *IPC* 指标。随着 ILP 提高，这个指标应当上升。例如，随着 ILP 的增加，你应当看到发射效率或每周期指令数指标上升。举例来说，如果你在展开后看到 IPC 指标从每 warp 调度器 1.0 上升到 1.8，这表明该 warp 现在平均每周期发射接近两条指令，而不再只是一条。不过，实际数值取决于指令组合以及架构的调度约束。
+
+You might also see that you can achieve good performance at lower occupancy than before. The ideal scenario is that you have enough ILP to keep each warp busy—and enough warps to keep the SM busy. Between those two, you’re covering latency both within and across warps.
+
+你可能还会发现，你现在能在比以前更低的占用率下取得良好性能。理想的情形是：你有足够的 ILP 让每个 warp 保持繁忙——又有足够的 warp 让 SM 保持繁忙。在这两者之间，你就同时覆盖了 warp 内与 warp 间的延迟。
+
+At this point, we’ve tackled warp-level parallelism and instruction-level parallelism. These are two ways to keep the GPU’s computational units busy. Next, we turn to measuring and improving arithmetic intensity. This is about maximizing the useful work done per memory access.
+
+至此，我们已经处理了 warp 级并行和指令级并行。这是让 GPU 计算单元保持繁忙的两种途径。接下来，我们转向测量并改善算术强度。这关乎最大化每次内存访问所完成的有用工作量。
+
+## Key Takeaways
+
+## 关键要点
+
+In this chapter, you saw how to uncover and eliminate GPU kernel bottlenecks by moving work from slow global memory into faster on-chip resources and compute units. By following a cycle of profiling, diagnosing, optimizing, and reprofiling, you can transform kernels from underutilized or memory‐bound into compute‐saturated, high‐throughput routines. These techniques will help utilize the full power of your GPUs:
+
+在本章中，你看到了如何通过把工作从慢速的全局内存搬到更快的片上资源和计算单元，来发现并消除 GPU 核函数瓶颈。通过遵循剖析、诊断、优化、再剖析的循环，你可以把核函数从利用不足或访存受限，转变为计算饱和、高吞吐的例程。这些技术将帮助你发挥 GPU 的全部威力：
+
+*Profiling with Nsight and* torch.profiler Start with Nsight Systems to visualize end‐to‐end timelines and reveal CPU‐GPU gaps, kernel overlaps, and NVTX spans. Then drill into individual kernels with Nsight Compute’s stall metrics, roofline analysis, and occupancy reports. In PyTorch code, you can insert profiler instrumentation (using the torch.profiler API, built on the Kineto library) to map Python-level operations directly to GPU activities. Remember that the PyTorch profiler’s with_flops estimates are formula-based on a limited set of operators. It does not read GPU hardware counters. For hardware counters, use Nsight Compute on the kernels of interest.
+
+*用 Nsight 和* torch.profiler *进行剖析* 先从 Nsight Systems 入手，可视化端到端时间线，揭示 CPU-GPU 间隙、核函数重叠以及 NVTX 跨度。然后用 Nsight Compute 的停顿指标、Roofline 分析和占用率报告深入到单个核函数。在 PyTorch 代码中，你可以插入剖析器埋点（使用构建在 Kineto 库之上的 torch.profiler API），把 Python 层的操作直接映射到 GPU 活动。请记住，PyTorch 剖析器的 with_flops 估算是基于公式的，仅覆盖有限的一组算子。它并不读取 GPU 硬件计数器。对于硬件计数器，请在感兴趣的核函数上使用 Nsight Compute。
+
+*Tuning occupancy to hide latency* Adequate warps per SM are essential to cover memory and instruction latencies. You can reduce per‐thread register/shared‐memory usage through code refactoring or compiler hints. You should also choose block sizes (e.g., 128–256 threads) that fit the SM resources. Doing these will increase your kernel’s achieved occupancy to an optimal range—around 50%–75%—and stop underutilization (e.g., ~32-48 warps on Blackwell).
+
+*调优占用率以隐藏延迟* 每 SM 有足够的 warp 对于覆盖内存和指令延迟至关重要。你可以通过重构代码或使用编译器提示来降低每线程的寄存器/共享内存用量。你还应选择契合 SM 资源的线程块大小（例如 128–256 threads）。做到这些将把核函数的实测占用率提升到最优区间——大约 50%–75%——并终止利用不足（例如 Blackwell 上约 32-48 warps）。
+
+*Minimizing warp divergence for SIMT efficiency* Because warps execute in lockstep, any branch divergence means masked lanes sit idle. Restructure kernels so that all threads in a warp follow the same path. Use predicated operations like ternary math and torch.maximum—or employ warp-vote intrinsics to compact active lanes. This will boost warp execution efficiency and reduce serialized execution.
+
+*为 SIMT 效率最小化 warp 分歧* 由于 warp 以锁步方式执行，任何分支分歧都意味着被掩蔽的通道处于空闲。重构核函数，使一个 warp 中的所有线程走相同的路径。使用像三元运算和 torch.maximum 这样的谓词化操作——或者利用 warp 投票内建函数来压紧活跃通道。这将提升 warp 执行效率并减少串行化执行。
+
+*Recognizing performance regimes* Every kernel falls into one of four buckets: underutilized, latency bound, memory bound, or compute bound. This is based on FLOPS, bandwidth usage, and stall reasons. Understanding which regime applies will help direct the exact optimization strategy. For instance, a high Long Scoreboard stall means the workload is latency bound.
+
+*识别性能区间* 每个核函数都落入四类中的一类：利用不足、延迟受限、访存受限或计算受限。这一判断基于 FLOPS、带宽使用情况和停顿原因。理解适用哪一个区间将有助于确定确切的优化策略。例如，高 Long Scoreboard 停顿意味着该工作负载是延迟受限的。
+
+*Exposing ILP* By unrolling loops, breaking dependency chains, and prefetching data, you expose instruction-level parallelism so that each thread can issue multiple independent operations per cycle. This lets two- or four-way ILP reduce the warps needed to fill an SM in half—reducing execution-dependency stalls, raising IPC, and decreasing the “Stall: Exec Dependency” metric. Always profile different ILP depths alongside thread counts to find your kernel’s sweet spot.
+
+*暴露 ILP* 通过展开循环、打断依赖链和预取数据，你暴露出指令级并行，使每个线程每周期都能发射多个独立操作。这让双路或四路 ILP 把填满一个 SM 所需的 warp 数减少一半——减少执行依赖停顿、提高 IPC，并降低“Stall: Exec Dependency”指标。请始终把不同的 ILP 深度与线程数一并剖析，以找到你核函数的最佳平衡点。
+
+*Iterative optimization and validation* After each change, including occupancy tweaks, ILP restructuring, tiling, or precision scaling, you should reprofile to confirm reduced memory stalls, fewer execution dependencies, and higher achieved occupancy or FLOPS. Always compare results to a FP32 baseline using asserts or numeric checks to guard against unacceptable accuracy regressions when lowering precision.
+
+*迭代优化与验证* 每次改动之后——无论是占用率微调、ILP 重构、分块（tiling），还是精度缩放——你都应重新剖析，以确认内存停顿减少、执行依赖变少、实测占用率或 FLOPS 提高。在降低精度时，务必用断言或数值检查将结果与 FP32 基线比对，以防出现不可接受的精度回退。
+
+## Conclusion
+
+## 结语
+
+You saw how effectively tuning GPU performance requires an iterative workflow. First, measure with profilers. Then identify your primary bottlenecks (compute, memory, interconnects, etc.). Last, apply the right optimizations and repeat. While each new GPU architecture brings improvements in compute and memory bandwidth, they also add complexity. You must constantly stay on top of these innovations in order to sustain peak performance.
+
+你看到了，有效地调优 GPU 性能需要一套迭代的工作流。首先，用剖析器测量。然后，识别你的主要瓶颈（计算、内存、互连等）。最后，施加正确的优化并重复。虽然每一代新的 GPU 架构都在计算和内存带宽上带来改进，但它们也增添了复杂性。你必须持续紧跟这些创新，才能维持峰值性能。
+
+We covered how to tune occupancy, avoid warp divergence, and increase ILP. You also saw how to use profilers to correlate CPU, kernel, and NVLink traffic across GPUs. Then we went into Nsight Compute for per-kernel details.
+
+我们讲解了如何调优占用率、避免 warp 分歧以及提高 ILP。你还看到了如何用剖析器把跨 GPU 的 CPU、核函数和 NVLink 流量关联起来。随后我们深入 Nsight Compute 获取逐核函数的细节。
+
+In the next chapters, we’ll extend this foundation by focusing on kernel-level efficiency to increase arithmetic intensity. To do this you will fully utilize the GPUs hardware-optimized resources such as Tensor Cores for compute, TMEM to service the Tensor Cores, and TMA for data transfers. TMA remains the preferred method for bulk copies from global to shared on modern GPUs that support it. Let’s continue pushing toward the hardware’s peak performance limits!
+
+在接下来的几章中，我们将以此为基础，聚焦核函数级的效率，以提高算术强度。为此，你将充分利用 GPU 硬件优化的资源，例如用于计算的 Tensor Cores、为 Tensor Cores 供数的 TMEM，以及用于数据传输的 TMA。在支持 TMA 的现代 GPU 上，TMA 仍是从全局内存到共享内存进行批量拷贝的首选方法。让我们继续向着硬件的峰值性能极限进发！
