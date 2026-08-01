@@ -1,0 +1,2715 @@
+# Chapter 14. PyTorch Compiler, OpenAI Triton, and XLA Backends
+
+# 第 14 章 PyTorch 编译器、OpenAI Triton 与 XLA 后端
+
+In Chapter 13, we discussed multiple ways to optimize and tune PyTorch-based training and inference workloads. We touched on the PyTorch compiler and how it automates kernel fusion and other kernel-level techniques to improve performance with very little changes to your code.
+
+在第 13 章中，我们讨论了优化与调优基于 PyTorch 的训练和推理工作负载的多种方法，并简要介绍了 PyTorch 编译器，以及它如何自动完成核函数融合（kernel fusion）等核函数级技术，从而在几乎不改动代码的情况下提升性能。
+
+In this chapter, we dive deeper into the dynamic PyTorch compilation stack, including components like TorchDynamo, Ahead-of-Time Autograd (AOT Autograd), and PrimTorch Intermediate Representation (IR) (aka *Prims* or *Prims IR*)—as well as compiler backends like TorchInductor, Accelerated Linear Algebra (XLA), and OpenAI’s Triton ecosystem. The PyTorch compiler stack is shown in Figure 14-1.
+
+本章我们将深入这套动态的 PyTorch 编译栈，涵盖 TorchDynamo、提前自动微分（Ahead-of-Time Autograd，AOT Autograd）、PrimTorch 中间表示（intermediate representation，IR）（又称 *Prims* 或 *Prims IR*）等组件，以及 TorchInductor、加速线性代数（Accelerated Linear Algebra，XLA）、OpenAI 的 Triton 生态等编译器后端（compiler backend）。PyTorch 编译栈如图 14-1 所示。
+
+We also cover tools for debugging the compilation pipeline as well as libraries for scaling PyTorch across multi-GPU and multinode clusters. We will then explore how torch.compile works under the hood and how to handle dynamic shapes and variable sequence lengths efficiently.
+
+我们还会介绍用于调试编译流水线的工具，以及在多 GPU、多节点集群上扩展 PyTorch 的库。随后，我们将探究 torch.compile 的底层工作原理，以及如何高效处理动态形状（dynamic shapes）与可变序列长度。
+
+We will also examine the PyTorch compiler’s integration with the OpenAI Triton ecosystem. Our goal is to accelerate and scale our PyTorch models and applications without sacrificing the flexible, eager-execution development experience of PyTorch.
+
+我们还将考察 PyTorch 编译器与 OpenAI Triton 生态的集成。我们的目标是在不牺牲 PyTorch 灵活的即时执行（eager execution）开发体验的前提下，加速并扩展我们的 PyTorch 模型与应用。
+
+![Figure 14-1. Overview of PyTorch compiler stack](AI%20Systems%20Performance%20Engineering-ch14_images/figure-14-1.png)
+
+![图 14-1. PyTorch 编译栈概览](AI%20Systems%20Performance%20Engineering-ch14_images/figure-14-1.png)
+
+## PyTorch Compiler Deep Dive
+
+## PyTorch 编译器深入剖析
+
+As described in Chapter 13, PyTorch’s torch.compile will compile your PyTorch code (and models) to produce significant speedups. In most cases, you can do this in just a single line of code, as shown next. We’ll talk about the different options as we go along:
+
+正如第 13 章所述，PyTorch 的 torch.compile 会编译你的 PyTorch 代码（以及模型），带来显著的加速。多数情况下，只需一行代码即可完成，如下所示。我们会在后文逐步讲解各种选项：
+
+```
+compiled_model = torch.compile(model,
+  mode="max-autotune",
+#  ...
+)
+```
+
+```
+compiled_model = torch.compile(model,
+  mode="max-autotune",
+#  ...
+)
+```
+
+This section breaks down the PyTorch compilation pipeline steps, including TorchDynamo’s graph capture, AOT Autograd’s combined forward/backward graph optimization, PrimTorch IR, and TorchInductor’s code generation. This pipeline is responsible for producing optimized kernels for the target GPU hardware and is shown in Figure 14-2.
+
+本节拆解 PyTorch 编译流水线的各个步骤，包括 TorchDynamo 的图捕获、AOT Autograd 对前向/反向图的联合优化、PrimTorch IR，以及 TorchInductor 的代码生成（code generation）。这条流水线负责为目标 GPU 硬件生成优化后的核函数，如图 14-2 所示。
+
+![Figure 14-2. PyTorch compiler pipeline (source: https://oreil.ly/55JDn)](AI%20Systems%20Performance%20Engineering-ch14_images/figure-14-2.png)
+
+![图 14-2. PyTorch 编译器流水线（来源：https://oreil.ly/55JDn）](AI%20Systems%20Performance%20Engineering-ch14_images/figure-14-2.png)
+
+### TorchDynamo for Bytecode Capture and Graph Extraction
+
+### 用于字节码捕获与图提取的 TorchDynamo
+
+TorchDynamo, or just Dynamo, is the first stage of torch.compile. It hooks into Python’s frame-evaluation mechanism to intercept model execution at the bytecode level.
+
+TorchDynamo（简称 Dynamo）是 torch.compile 的第一个阶段。它挂接到 Python 的帧求值（frame-evaluation）机制中，在字节码层面拦截模型执行。
+
+Dynamo hooks into CPython’s frame evaluation to identify tensor-producing bytecode regions and constructs an execution graph for those regions. It then executes the compiled graph using the chosen backend. Unsupported code is left to run eagerly.
+
+Dynamo 挂接到 CPython 的帧求值机制，识别出会产生张量的字节码区域，并为这些区域构建执行图，然后用所选后端执行编译后的图。不受支持的代码则留待以即时执行方式运行。
+
+This interception and rewriting mechanism is what lets TorchDynamo capture sequences of PyTorch operations into a graph representation that can be optimized by the next steps, AOT Autograd and PrimTorch IR, covered in the next sections.
+
+正是这种拦截与重写机制，使 TorchDynamo 能够把一连串 PyTorch 操作捕获为图表示，以便后续步骤——即接下来几节介绍的 AOT Autograd 与 PrimTorch IR——对其进行优化。
+
+TorchDynamo leverages the CPython Frame Evaluation API (PEP 523) to capture the operations safely—and with minimal overhead. Normally, the Python interpreter executes each operation one by one. With Dynamo enabled, however, the interpreter redirects its execution to Dynamo, which aggregates the tensor operations into a graph before executing them. This enables whole-graph optimizations like kernel fusion, which reduces per-operation Python and host-side overhead.
+
+TorchDynamo 利用 CPython 帧求值 API（PEP 523）以最小的开销安全地捕获操作。通常，Python 解释器会逐个执行每个操作；但启用 Dynamo 后，解释器会把执行重定向到 Dynamo，由它先将张量操作聚合成图，再执行。这样便能进行核函数融合之类的全图优化，从而减少每个操作的 Python 及主机端开销。
+
+Instead of launching a new GPU kernel for each operation and paying per-operation Python overhead, the compiled graph can fuse many operations into one or a few kernels. This reduces dispatch overhead and improves memory access patterns.
+
+编译后的图可以把许多操作融合进一个或少数几个核函数，而不必为每个操作都启动一个新的 GPU 核函数并承担逐操作的 Python 开销。这减少了分派开销，并改善了内存访问模式。
+
+In Chapter 13, we saw how Python overhead and many small operations can bottleneck models. We also saw that TorchDynamo addresses this issue by batching small operations into larger units when possible—assuming the chain of operations is graph-friendly and doesn’t cause too many graph breaks.
+
+在第 13 章中，我们看到 Python 开销与大量小操作会成为模型的瓶颈；也看到 TorchDynamo 通过在可能时把小操作合并成更大的单元来解决这一问题——前提是这一串操作对图友好，且不会引发过多图中断（graph break）。
+
+When TorchDynamo is enabled by torch.compile, it inspects each Python opcode. Whenever it encounters a PyTorch tensor operation such as arithmetic or a neural network layer, it doesn’t execute it immediately. Instead, Dynamo appends the operation as a node in an FX graph and defers execution to the compiled backend for captured regions. TorchDynamo continues this process until it hits some code it can’t handle. At this point, a graph break occurs (more on this in a bit), and the unsupported operations run in regular, noncompiled eager mode.
+
+当 torch.compile 启用 TorchDynamo 后，它会检查每一条 Python 字节码指令。每当遇到 PyTorch 张量操作（如算术运算或神经网络层）时，它并不立即执行，而是把该操作作为一个节点追加到 FX 图（FX graph）中，并将已捕获区域的执行推迟给编译后端。TorchDynamo 会持续这一过程，直到遇到它无法处理的代码。此时便发生一次图中断（稍后详述），不受支持的操作则以常规的、未编译的即时执行模式（eager mode）运行。
+
+TorchDynamo tries to compile as large a portion of your program as possible into a single graph, but it will fall back to Python eager execution when it can’t proceed due to unsupported constructs such as complex control flow or non-PyTorch library calls. It does this to ensure correctness.
+
+TorchDynamo 会尽量把你程序中尽可能大的部分编译进单个图，但当遇到不受支持的结构（如复杂的控制流或非 PyTorch 库调用）而无法继续时，它会回退到 Python 即时执行。这样做是为了保证正确性。
+
+After a block of unsupported operations has passed, Dynamo will resume capturing subsequent operations into a new graph after that point. This mix of compiled and noncompiled execution gives you the best of both worlds: you keep PyTorch’s flexibility where needed but compile everything else for speed.
+
+在一段不受支持的操作结束之后，Dynamo 会从该点起把后续操作重新捕获进一个新图。这种编译与非编译混合执行的方式让你兼得两者之长：在需要之处保留 PyTorch 的灵活性，而将其余部分统统编译以换取速度。
+
+> You want to avoid graph breaks whenever possible, as they interrupt whole-graph optimizations and limit the performance benefits of the compiler.
+
+> 应尽可能避免图中断，因为它们会打断全图优化，并限制编译器带来的性能收益。
+
+You can use torch.compiler.set_stance("fail_on_recompile") to force Dynamo to raise an error to catch unsafe recompilations. It will log the reason for recompile and help you debug the graph break. This gives you full visibility into why your graph is splitting. The code is shown here:
+
+你可以使用 torch.compiler.set_stance("fail_on_recompile") 强制 Dynamo 抛出错误，以捕捉不安全的重新编译（recompilation）。它会记录重新编译的原因，帮助你调试图中断，让你能够充分了解图为何被拆分。代码如下所示：
+
+```
+// fail on graph breaks, recompiles
+torch.compiler.set_stance("fail_on_recompile")
+compiled_model = torch.compile(model,
+  mode="max-autotune",
+  ...
+)
+```
+
+```
+// fail on graph breaks, recompiles
+torch.compiler.set_stance("fail_on_recompile")
+compiled_model = torch.compile(model,
+  mode="max-autotune",
+  ...
+)
+```
+
+This way, you can refactor the code paths that are causing the break—or mark them as expected graph boundaries with torch._dynamo.allow_in_graph(), as you’ll see in a bit. Once your graph is clean, you can switch back to torch.compiler.set_stance("eager_on_recompile"). Remember, setting this back will cause TorchDynamo to silently fall back to eager mode if a subsequent graph break occurs.
+
+这样，你就可以重构导致中断的代码路径——或者用 torch._dynamo.allow_in_graph() 把它们标记为预期中的图边界，后文会讲到。一旦图变得干净，你就可以切回 torch.compiler.set_stance("eager_on_recompile")。请记住，改回该设置后，若随后发生图中断，TorchDynamo 会静默地回退到即时执行模式。
+
+The output of TorchDynamo’s capture is called an *FX Graph* of your code. FX is an intermediate representation (IR) in which each node is a call to a PyTorch aten operator or built-in Python function. For example, consider a simple Python function, as shown here:
+
+TorchDynamo 捕获的产物称为你代码的 *FX 图*。FX 是一种中间表示（IR），其中每个节点都是对某个 PyTorch aten 算子或内置 Python 函数的调用。例如，考虑一个简单的 Python 函数，如下所示：
+
+```
+def f(x, y):
+    z = x.sin() + y
+    return z.sum()
+```
+
+```
+def f(x, y):
+    z = x.sin() + y
+    return z.sum()
+```
+
+Here, TorchDynamo will produce an FX Graph roughly equivalent to the following pseudocode:
+
+此时，TorchDynamo 会生成一个大致等价于以下伪代码的 FX 图：
+
+```
+graph():  # pseudo-code for FX IR
+    %x : Tensor = Placeholder[target=x]
+    %y : Tensor = Placeholder[target=y]
+    %sin : Tensor = torch.sin(%x)
+    %add : Tensor = torch.add(%sin, %y)
+    %sum : Tensor = torch.sum(%add)
+    return %sum
+```
+
+```
+graph():  # pseudo-code for FX IR
+    %x : Tensor = Placeholder[target=x]
+    %y : Tensor = Placeholder[target=y]
+    %sin : Tensor = torch.sin(%x)
+    %add : Tensor = torch.add(%sin, %y)
+    %sum : Tensor = torch.sum(%add)
+    return %sum
+```
+
+The FX Graph nodes correspond to Placeholder inputs and calls to primitive ATen operations like aten::sin, aten::add, aten::sum, clearly representing the computation graph structure. Once constructed, this FX Graph is handed off to AOT Autograd for combined forward-pass and backward-pass tracing.
+
+这些 FX 图节点对应于 Placeholder 输入以及对 aten::sin、aten::add、aten::sum 等原始 ATen 操作的调用，清晰地表示了计算图结构。一旦构建完成，该 FX 图便交给 AOT Autograd，以进行前向与反向传播的联合追踪。
+
+AOT Autograd’s generated forward and backward combined trace is then sent to a backend compiler such as TorchInductor or XLA to perform kernel fusion and generate optimized device code. TorchDynamo itself remains framework-agnostic and focuses on accurate, low-overhead graph capture. TorchDynamo delegates all heavy optimizations to downstream compiler stages.
+
+AOT Autograd 生成的前向与反向合并追踪随后被送往 TorchInductor 或 XLA 等后端编译器，以执行核函数融合并生成优化后的设备代码。TorchDynamo 自身则保持与框架无关，专注于准确、低开销的图捕获，并把所有繁重的优化都交给下游的编译器阶段。
+
+TorchDynamo inserts guards on Python values—such as tensor shapes, dtypes, and even global variables—that affect the graph trace. These guards ensure that if something changes that was assumed to be constant (e.g., tensor shape or dtype), the compiled graph is invalidated and recompiled if needed. This allows robust handling of dynamic shapes and model modifications—at the cost of additional recompilations when assumptions are violated.
+
+TorchDynamo 会在影响图追踪的 Python 值上插入保护条件（guard）——例如张量形状、dtype，甚至全局变量。这些保护条件确保：如果某个被假定为常量的东西（如张量形状或 dtype）发生变化，编译后的图便会失效，并在必要时重新编译。这样便能稳健地处理动态形状与模型改动——代价是在假设被违反时会产生额外的重新编译。
+
+> It’s recommended to monitor the number of graph recompilations when using the PyTorch compiler.
+
+> 建议在使用 PyTorch 编译器时监控图重新编译的次数。
+
+Using the default dynamic=None, the compiler will specialize using the observed shapes. When it encounters dynamic shapes, it will recompile a more dynamic kernel. It may recompile again if it later detects additional sources of dynamism.
+
+在默认的 dynamic=None 下，编译器会根据观察到的形状进行特化（specialization）。当遇到动态形状时，它会重新编译一个更具动态性的核函数；如果之后又检测到新的动态来源，还可能再次重新编译。
+
+In practice, this means you’ll see one extra compilation on the first varying-shape input—and only one extra compile. If you already know which input dimensions will vary, you can use torch._dynamo.mark_dynamic(tensor, dim) before running your model. This will preempt the initial compile.
+
+实际上，这意味着在第一个变化形状的输入上你会看到一次额外编译——而且只有一次额外编译。如果你已经知道哪些输入维度会变化，可以在运行模型之前使用 torch._dynamo.mark_dynamic(tensor, dim)，从而提前避免这次初始编译。
+
+You can further tune the compiler’s “stance” with torch.compiler.set_stance() to change how and when TorchDynamo falls back to eager or recompiles. A stance governs the compiler’s tolerance or strictness in the face of errors or fallbacks. This gives you more control of the trade-off between developer feedback and uninterrupted execution. The following are the stances as of this writing:
+
+你还可以用 torch.compiler.set_stance() 进一步调整编译器的“立场”（stance），以改变 TorchDynamo 何时以及如何回退到即时执行或重新编译。立场决定了编译器在面对错误或回退时的容忍度或严格程度，让你能更好地在开发者反馈与不间断执行之间权衡。以下是撰写本文时可用的立场：
+
+default The compiler tries to compile what it can, silently falling back to eager execution when unsupported code is encountered. This is the standard, default setting, which causes normal compilation behavior and fallbacks.
+
+default 编译器会尽量编译它能编译的部分，遇到不受支持的代码时静默回退到即时执行。这是标准的默认设置，产生正常的编译行为与回退。
+
+fail_on_recompile If a graph break or unsupported operation is encountered, the compiler raises an error. This is useful during development when you want to catch unexpected breaks or uncompiled paths.
+
+fail_on_recompile 一旦遇到图中断或不受支持的操作，编译器就抛出错误。这在开发阶段很有用，便于你捕捉意外的中断或未编译的代码路径。
+
+eager_on_recompile When a recompile is necessary, run the code in eager mode. If compiled code is already cached (and valid for the input), it should still be used.
+
+eager_on_recompile 当需要重新编译时，以即时执行模式运行代码。如果已有编译后的代码被缓存（且对该输入有效），则仍应使用它。
+
+force_eager Use eager mode and ignore all torch.compile directives.
+
+force_eager 使用即时执行模式，并忽略所有 torch.compile 指令。
+
+By capturing whole sequences of operations, TorchDynamo can perform whole-graph optimizations like kernel fusion to reduce launch overhead and minimize memory movement. It also eliminates Python-layer overhead for those fused operations. Figure 14-3 compares eager versus compiled modes, including the compiler cache.
+
+通过捕获整段操作序列，TorchDynamo 能够执行核函数融合之类的全图优化，从而减少启动开销并尽量减少内存搬运。它还消除了这些被融合操作的 Python 层开销。图 14-3 对比了即时执行与编译两种模式，也包括编译器缓存。
+
+Instead of executing each small operation and kernel launch separately, the compiler can fuse many operations into a single kernel. This reduces CPU-GPU synchronization points and improves memory locality. Otherwise, the GPU would be bottlenecked with lots of fine-grained operations, heavy synchronization, and excessive global memory accesses.
+
+编译器可以把许多操作融合进单个核函数，而不必分别执行每个小操作和每次核函数启动。这减少了 CPU–GPU 同步点，并改善了内存局部性。否则，GPU 会被大量细粒度操作、繁重的同步以及过多的全局内存访问拖成瓶颈。
+
+![Figure 14-3. PyTorch eager versus compiled modes](AI%20Systems%20Performance%20Engineering-ch14_images/figure-14-3.png)
+
+![图 14-3. PyTorch 即时执行与编译模式对比](AI%20Systems%20Performance%20Engineering-ch14_images/figure-14-3.png)
+
+TorchDynamo continues capturing until a graph break is needed. A graph break can be triggered by unsupported Python constructs (like certain control flows, e.g., an if statement using a Python bool instead of tensor operations) or by unsupported operations. When a graph break occurs, the current graph segment ends, and Dynamo falls back to eager mode for the code that can’t be captured. After that, TorchDynamo will start a new graph trace once it returns to traceable code.
+
+TorchDynamo 会持续捕获，直到需要一次图中断为止。图中断可能由不受支持的 Python 结构触发（如某些控制流，例如使用 Python bool 而非张量操作的 if 语句），也可能由不受支持的操作触发。发生图中断时，当前图段结束，Dynamo 对无法捕获的代码回退到即时执行模式。之后，一旦回到可追踪的代码，TorchDynamo 就会开始一段新的图追踪。
+
+You can successfully implement compiler-graph-friendly conditionals in PyTorch by expressing the logic as pure PyTorch tensor operations, including torch.where() with a mask. Here is an example that replaces a non-graph-friendly Python if statement with a pure-tensor operation masking approach:
+
+你可以把逻辑表达为纯 PyTorch 张量操作（包括配合掩码使用的 torch.where()），从而在 PyTorch 中成功实现对编译器图友好的条件判断。下面这个例子用纯张量操作的掩码方式替换了一个对图不友好的 Python if 语句：
+
+```
+# Compute a boolean mask from a data-dependent tensor condition
+# mask shape (batch_size,1) broadcastable to x’s
+mask = x.sum(dim=1, keepdim=True) > 0
+# Use torch.where to select element-wise between two tensor expressions
+# picks f(x) where mask is True, otherwise g(x)
+out = torch.where(mask, f(x), g(x))
+```
+
+```
+# Compute a boolean mask from a data-dependent tensor condition
+# mask shape (batch_size,1) broadcastable to x’s
+mask = x.sum(dim=1, keepdim=True) > 0
+# Use torch.where to select element-wise between two tensor expressions
+# picks f(x) where mask is True, otherwise g(x)
+out = torch.where(mask, f(x), g(x))
+```
+
+This avoids a Python if x.sum() > 0: statement, which causes a graph break. It does this by staying entirely within PyTorch’s graph-friendly tensor operations. In this case, TorchDynamo captures the whole sequence, including the mask and torch.where() without breaking the graph.
+
+这样就避免了会引发图中断的 Python if x.sum() > 0: 语句，做法是完全停留在 PyTorch 对图友好的张量操作之内。在这种情况下，TorchDynamo 会捕获整段序列，包括掩码和 torch.where()，而不会中断图。
+
+With each new release, PyTorch expands which operations can be captured without causing a graph break. For instance, high-level conditional primitives like torch.cond can capture certain if/else logic in graphs. Specifically, both branches are traced and compiled. torch.cond requires a boolean scalar predicate. Both branches must return the same structure and dtypes. And shapes must be consistent at runtime. Data-dependent branches will often lead to graph breaks.
+
+随着每次新版本发布，PyTorch 都会扩充可在不引发图中断的情况下被捕获的操作范围。例如，torch.cond 这类高级条件原语可以在图中捕获某些 if/else 逻辑。具体来说，两个分支都会被追踪并编译。torch.cond 要求一个布尔标量谓词；两个分支必须返回相同的结构与 dtype；并且形状在运行时必须一致。依赖数据的分支往往会导致图中断。
+
+> It’s recommended to minimize graph breaks by refactoring your code using tensor operations like torch.where() to maximize the continuous regions that TorchDynamo can capture.
+
+> 建议通过用 torch.where() 等张量操作重构代码来尽量减少图中断，从而最大化 TorchDynamo 能够捕获的连续区域。
+
+### AOT Autograd Fusion for Forward and Backward Passes
+
+### AOT Autograd 对前向与反向传播的融合
+
+Once TorchDynamo has captured an FX Graph for as much of the forward pass as possible, the next compiler phase is AOT Autograd. AOT Autograd runs the Dynamo-captured forward graph through PyTorch’s autograd engine in “functional” mode to record the backward operations. This is how the static backward graph is produced (this is in contrast to relying on PyTorch’s default autograd engine to execute the backward-pass operations one by one).
+
+一旦 TorchDynamo 为尽可能多的前向传播捕获了 FX 图，下一个编译器阶段便是 AOT Autograd。AOT Autograd 会以“函数式”模式让 Dynamo 捕获的前向图通过 PyTorch 的自动微分引擎运行，以记录反向操作。静态反向图正是这样产生的（这与依赖 PyTorch 默认自动微分引擎逐个执行反向传播操作形成对比）。
+
+In essence, AOT Autograd generates a joint forward-backward graph that can then be optimized and fused as a whole. And it guarantees the same forward and backward results as eager mode.
+
+本质上，AOT Autograd 会生成一个联合的前向–反向图，随后便可作为整体进行优化与融合。而且它保证前向与反向结果与即时执行模式一致。
+
+AOT Autograd works by tracing the forward graph through the autograd engine to capture the gradient computations. It effectively runs the forward graph with torch.autograd.forward_ad (or a similar technique) to record which operations are needed for the backward computations. The result is a combined forward and backward graph. The combined graph can then be optimized using common-subexpression elimination, etc. Later, it’s compiled by a backend like TorchInductor or XLA.
+
+AOT Autograd 的工作方式是让前向图通过自动微分引擎进行追踪，以捕获梯度计算。它实际上会用 torch.autograd.forward_ad（或类似技术）运行前向图，记录反向计算所需的操作。其结果是一个前向与反向合并的图。这个合并图随后可以用公共子表达式消除（common-subexpression elimination）等手段优化，之后再由 TorchInductor 或 XLA 等后端编译。
+
+By planning both the forward and backward ahead of time, the PyTorch compiler can holistically fuse across the boundary of the forward and backward passes together. This results in ahead-of-time fusion of operations that span the two phases. For example, it can fuse an elementwise operation in the forward pass with the corresponding elementwise gradient computation in the backward pass, if possible, into one kernel.
+
+通过提前规划前向与反向，PyTorch 编译器可以整体地跨越前向与反向传播的边界进行融合。这带来了跨这两个阶段的操作的提前融合。例如，它可以在可能时把前向传播中的一个逐元素操作与反向传播中相应的逐元素梯度计算融合进同一个核函数。
+
+The compiler can also eliminate overhead by reusing intermediate results between forward and backward computations when safe to do so. This can improve performance greatly for model training workloads in which backward operations can dominate the overall runtime.
+
+在安全的情况下，编译器还可以通过在前向与反向计算之间复用中间结果来消除开销。对于反向操作可能主导整体运行时间的模型训练工作负载来说，这能大幅提升性能。
+
+Without AOT Autograd, PyTorch would need to execute each backward operation separately using the default PyTorch autograd engine—independently of the forward pass. With AOT Autograd, the graph of execution is optimized holistically.
+
+若没有 AOT Autograd，PyTorch 就需要用默认的 PyTorch 自动微分引擎单独执行每个反向操作——与前向传播相互独立。有了 AOT Autograd，执行图便得到整体优化。
+
+The resulting joint graph produced by AOT Autograd is guaranteed to compute the same results (this is why graph breaks are needed when the graph can’t guarantee correctness). This joint graph can be further optimized because the whole sequence of operations, forward and backward, is known.
+
+AOT Autograd 产生的联合图保证计算出相同的结果（这也是为什么当图无法保证正确性时需要图中断的原因）。由于前向与反向的整段操作序列都已知，这个联合图可以被进一步优化。
+
+By fusing operations and memory usage across the forward and backward passes, we reduce memory accesses and kernel-launch overhead. PyTorch’s compiled mode automatically uses AOT Autograd under the hood when you call torch.compile for operations and workloads that involve gradients, such as model training.
+
+通过跨前向与反向传播融合操作和内存使用，我们减少了内存访问与核函数启动开销。当你对涉及梯度的操作和工作负载（如模型训练）调用 torch.compile 时，PyTorch 的编译模式会在底层自动使用 AOT Autograd。
+
+In short, AOT Autograd is used by torch.compile to compute gradients ahead of time during model training. It handles most autograd operations seamlessly and guarantees the same results as eager mode. It reuses buffers across the forward and backward passes to reduce peak memory usage. And while this phase is mostly invisible to the end user, it’s a key component to enabling large speedups in modern AI model training workloads.
+
+简而言之，torch.compile 利用 AOT Autograd 在模型训练期间提前计算梯度。它能无缝处理大多数自动微分操作，并保证结果与即时执行模式一致；它还跨前向与反向传播复用缓冲区，以降低峰值内存占用。虽然这个阶段对最终用户基本不可见，但它是让现代 AI 模型训练工作负载获得大幅加速的关键组件。
+
+### PrimTorch IR (Prims) Simplified Operator Set
+
+### PrimTorch IR（Prims）精简算子集
+
+Before handing the graph over to a low-level code generator, PyTorch performs an intermediate representation (IR) transformation known as PrimTorch IR (Prims) in some documentation and source code. PrimTorch IR is an IR that reduces the variety of operations in the graph down to a smaller core set of “primitive” operations, hence the name *PrimTorch*.
+
+在把图交给底层代码生成器之前，PyTorch 会执行一次中间表示变换，在部分文档和源码中称为 PrimTorch IR。PrimTorch IR 是一种把图中操作的种类精简为一小组核心“原始”操作的 IR，这也是 *PrimTorch* 这一名称的由来。
+
+For context, PyTorch has thousands (> 2,000) of operations in its full API. PrimTorch IR reduces this to a much smaller set of primitives on which the compiler can focus. In practice, PrimTorch IR defines around 250 primitive operations, such as basic arithmetic, reductions, copy, reshape, etc.
+
+作为背景，PyTorch 的完整 API 拥有数千（> 2,000）个操作。PrimTorch IR 把它精简为一组小得多的原始操作，让编译器可以聚焦其上。实际上，PrimTorch IR 定义了约 250 个原始操作，如基本算术、归约、复制、reshape 等。
+
+Many complex or high-level PyTorch aten operations can be decomposed into these primitives with PrimTorch IR. For instance, an “in-place” PyTorch operation like x.add_(y) is lowered into a functional add followed by an explicit copy back into x’s storage, as shown here:
+
+许多复杂或高级的 PyTorch aten 操作都可以借助 PrimTorch IR 分解（decomposition）为这些原始操作。例如，像 x.add_(y) 这样的“原地”PyTorch 操作会被下降（lowering）为一次函数式 add，再跟一次显式地复制回 x 存储的操作，如下所示：
+
+```
+%z    = aten::add(x, y)
+%copy = aten::copy_(x, %z)    # writes z’s data into x
+```
+
+```
+%z    = aten::add(x, y)
+%copy = aten::copy_(x, %z)    # writes z’s data into x
+```
+
+Here, the IR contains a separate aten::copy_ node instead of a special in-place mutation. This makes all tensor updates explicit and simplifies downstream compiler kernels by treating mutations as ordinary copy operations.
+
+这里，IR 中包含一个独立的 aten::copy_ 节点，而不是某种特殊的原地变更。这使所有张量更新都变得显式，并通过把变更当作普通的复制操作来简化下游的编译器核函数。
+
+Specifically, by converting in-place mutations into functional operations plus distinct copy nodes, the compiler no longer has to reason about aliasing or hidden side effects. As a result, fusion passes and memory-planning algorithms can operate on a purely functional dataflow. This allows more aggressive kernel fusion and predictable, high-performance code generation.
+
+具体而言，通过把原地变更转换为函数式操作外加独立的复制节点，编译器就不必再推理别名或隐藏的副作用。因此，融合过程与内存规划算法可以在纯函数式的数据流上运作，这就允许更激进的核函数融合以及可预测的高性能代码生成。
+
+PrimTorch IR also helps with things like eliminating aliasing and mutation in the graph. It tries to convert operations into a form that does not perform in-place updates when possible since these can complicate optimization. The output of the PrimTorch IR pass is an FX Graph that contains only aten IR and PrimTorch IR operations. The FX Graph is then ready for lowering by the backend.
+
+PrimTorch IR 还有助于消除图中的别名和变更等问题。它会尽可能把操作转换为不执行原地更新的形式，因为这些原地更新会使优化复杂化。PrimTorch IR 这一处理阶段的输出是一个只包含 aten IR 与 PrimTorch IR 操作的 FX 图。随后，该 FX 图便可交由后端进行下降。
+
+By doing this IR standardization, PrimTorch IR provides a stable, simplified interface for compiler backends to target. Instead of having to implement thousands of PyTorch operations, a backend like TorchInductor only needs to support the 250 primitives—other higher-level operations are derived from the primitives. This greatly reduces complexity.
+
+通过这种 IR 标准化，PrimTorch IR 为编译器后端提供了一个稳定、简化的目标接口。像 TorchInductor 这样的后端无需实现成千上万个 PyTorch 操作，只需支持那 250 个原始操作即可——其他更高级的操作都由这些原始操作派生而来。这大大降低了复杂度。
+
+And since most high-level operations (e.g., 2,000+ PyTorch ops) can be decomposed into the existing primitives, the set of PrimTorch IR primitives evolves relatively slowly—even as PyTorch adds new operations to adapt to new algorithms, models, and techniques.
+
+而且，由于大多数高级操作（如 2,000 多个 PyTorch 操作）都能被分解为现有的原始操作，即便 PyTorch 为适配新算法、新模型和新技术而不断新增操作，PrimTorch IR 这组原始操作的集合演进得也相对缓慢。
+
+> The stable PrimTorch IR interface means that to support a new accelerator, for example, developers need only implement the 250 primitives rather than thousands of ATen operations.
+
+> 稳定的 PrimTorch IR 接口意味着，例如要支持一款新的加速器，开发者只需实现那 250 个原始操作，而不必实现成千上万个 ATen 操作。
+
+To summarize the pipeline so far: TorchDynamo captures a graph, AOT Autograd adds a backward pass and forms a joint forward-backward graph, and then PrimTorch IR canonicalizes the operations to a leaner, more primitive set. At this point, we have a fairly standard, device-agnostic representation of the whole computation—including the forward and backward passes—in terms of core operations. Now let’s turn to the actual code-generation stage performed by the compiler backend.
+
+小结一下目前为止的流水线：TorchDynamo 捕获一个图，AOT Autograd 加入反向传播并形成一个联合的前向–反向图，然后 PrimTorch IR 把操作规范化为一组更精简、更原始的集合。到这一步，我们就以核心操作的形式获得了整个计算——包括前向与反向传播——的一个相当标准、与设备无关的表示。现在，让我们转向由编译器后端执行的实际代码生成阶段。
+
+### TorchInductor Backend Code Generation
+
+### TorchInductor 后端代码生成
+
+The final stage of the torch.compile stack is the compiler backend. TorchInductor, or Inductor, is PyTorch’s default compiler backend. Inductor takes the optimized, joined forward and backward FX Graph consisting of aten + PrimTorch IR operations and generates high-performance code for the target hardware, including NVIDIA GPUs, AMD GPUs, CPUs, and others.
+
+torch.compile 栈的最后一个阶段是编译器后端。TorchInductor（简称 Inductor）是 PyTorch 的默认编译器后端。Inductor 接收由 aten 与 PrimTorch IR 操作组成的、经过优化并合并的前向与反向 FX 图，为目标硬件（包括 NVIDIA GPU、AMD GPU、CPU 等）生成高性能代码。
+
+> XLA is an alternate backend targeting non-CUDA hardware. It’s mainly used for Google Cloud TPUs through the OpenXLA project. But it can support other accelerators that adopt XLA IR. For example, Meta’s in-house inference ASIC, Meta Training & Inference Accelerator (MTIA), uses XLA. Additionally, AWS’s custom Inferentia and Trainium accelerator chips run PyTorch with an XLA compiler in its open source AWS Neuron SDK. NVIDIA GPUs typically use TorchInductor, however.
+
+> XLA 是一个面向非 CUDA 硬件的备选后端。它主要通过 OpenXLA 项目用于 Google Cloud TPU，但也可以支持其他采用 XLA IR 的加速器。例如，Meta 自研的推理 ASIC——Meta 训练与推理加速器（Meta Training & Inference Accelerator，MTIA）就使用 XLA。此外，AWS 定制的 Inferentia 与 Trainium 加速器芯片在其开源的 AWS Neuron SDK 中通过 XLA 编译器运行 PyTorch。不过，NVIDIA GPU 通常使用 TorchInductor。
+
+TorchInductor works by *lowering* the graph to a loop-level, define-by-run IR that it compiles to efficient code. Internally, Inductor represents operations as loops over multidimensional data. It automatically groups nodes from the FX Graph into fused loop blocks when possible. Each group becomes a kernel during code generation.
+
+TorchInductor 的工作方式是把图 *下降* 为一种循环级、随运行定义（define-by-run）的 IR，再将其编译为高效代码。在内部，Inductor 把操作表示为对多维数据的循环。它会在可能时自动把 FX 图中的节点分组为融合的循环块，每一组在代码生成时都会成为一个核函数。
+
+Inductor also supports symbolic shapes, which allow dynamic dimensions. The IR is somewhat higher-level than raw CUDA, as it represents things like elementwise computations as loops over tensor indices. The IR is user-inspectable, which helps debugging and even extending.
+
+Inductor 还支持符号化形状（symbolic shapes），从而允许动态维度。这种 IR 比原生 CUDA 稍高级，因为它把逐元素计算之类的东西表示为对张量索引的循环。该 IR 可供用户检视，有助于调试甚至扩展。
+
+TorchInductor’s IR can also be used for ahead-of-time compilation flows with torch.export() and AOTInductor. AOTInductor compiles artifacts produced by torch.export for AOT use cases such as packaging and deployment. This allows saving and reusing the compiled code across runs. Export is highlighted in the context of torch.compile() in Figure 14-4.
+
+TorchInductor 的 IR 还可用于配合 torch.export() 和 AOTInductor 的提前编译流程。AOTInductor 会编译由 torch.export 产生的产物，用于打包和部署等 AOT 场景，从而可以跨多次运行保存并复用编译后的代码。图 14-4 在 torch.compile() 的语境中突出展示了导出流程。
+
+![Figure 14-4. PyTorch compile and export (TorchDynamo → AOT Autograd → PrimTorch IR → TorchInductor → Triton/LLVM NVPTX); export via torch.export/AOTInductor; CUDA Graphs are used when shapes are static](AI%20Systems%20Performance%20Engineering-ch14_images/figure-14-4.png)
+
+![图 14-4. PyTorch 编译与导出（TorchDynamo → AOT Autograd → PrimTorch IR → TorchInductor → Triton/LLVM NVPTX）；通过 torch.export/AOTInductor 导出；形状为静态时使用 CUDA Graphs](AI%20Systems%20Performance%20Engineering-ch14_images/figure-14-4.png)
+
+For NVIDIA GPU backends, TorchInductor uses OpenAI’s Triton JIT compiler to generate the actual GPU kernels. Triton is a CUDA-like domain-specific language (DSL) written in Python. Triton also includes a compiler for its DSL (we’ll cover Triton more in a bit).
+
+对于 NVIDIA GPU 后端，TorchInductor 使用 OpenAI 的 Triton JIT 编译器来生成实际的 GPU 核函数。Triton 是一种用 Python 编写的、类似 CUDA 的领域特定语言（domain-specific language，DSL）。Triton 还包含针对其 DSL 的编译器（稍后我们会更多地介绍 Triton）。
+
+TorchInductor translates its loop-level IR into Triton code and then uses the Triton compiler to convert the Triton code into NVIDIA PTX directly using LLVM. Remember that PTX is NVIDIA’s low-level instruction set architecture (ISA) for its NVIDIA GPUs.
+
+TorchInductor 会把它的循环级 IR 翻译成 Triton 代码，然后用 Triton 编译器借助 LLVM 直接把 Triton 代码转换为 NVIDIA PTX。请记住，PTX 是 NVIDIA 为其 GPU 设计的底层指令集架构（instruction set architecture，ISA）。
+
+> Importantly, Triton lowers to NVIDIA PTX using LLVM NVPTX. It does not invoke NVCC for kernel compilation. This approach lets TorchInductor produce custom kernels on the fly that are tailored to your specific model or algorithm.
+
+> 重要的是，Triton 使用 LLVM NVPTX 下降到 NVIDIA PTX，而不会调用 NVCC 来编译核函数。这种方式让 TorchInductor 能够即时生成为你特定模型或算法量身定制的自定义核函数。
+
+The loop-level IR is implemented in Python, which makes it easy to inspect and extend. For example, suppose a graph has an operation z = x.permute(1,0) + x[2,:]. Inductor might represent this operation with the following IR:
+
+循环级 IR 用 Python 实现，因而易于检视和扩展。例如，假设某个图中有一个操作 z = x.permute(1,0) + x[2,:]，Inductor 可能会用下面的 IR 来表示它：
+
+```
+def inner_fn(index: List[sympy.Expr]):
+    i1, i0 = index  # index variables for dims
+    tmp0 = ops.load("x", i1 + i0*size1)         # x[i1, i0]
+    tmp1 = ops.load("x", 2*size1 + i0)          # x[2, i0]
+    return ops.add(tmp0, tmp1)                 # elementwise add
+torchinductor.ir.Pointwise(
+    device=torch.device("cuda"), dtype=torch.float32,
+    inner_fn=inner_fn, ranges=[size0, size1]
+)
+```
+
+```
+def inner_fn(index: List[sympy.Expr]):
+    i1, i0 = index  # index variables for dims
+    tmp0 = ops.load("x", i1 + i0*size1)         # x[i1, i0]
+    tmp1 = ops.load("x", 2*size1 + i0)          # x[2, i0]
+    return ops.add(tmp0, tmp1)                 # elementwise add
+torchinductor.ir.Pointwise(
+    device=torch.device("cuda"), dtype=torch.float32,
+    inner_fn=inner_fn, ranges=[size0, size1]
+)
+```
+
+Here, size0 and size1 are the dimensions of the input, x. And inner_fn describes how to compute one element of the output. The Pointwise node represents a loop nest over those ranges that applies inner_fn elementwise to produce the output.
+
+这里，size0 和 size1 是输入 x 的各个维度，而 inner_fn 描述了如何计算输出的一个元素。Pointwise 节点表示一个在这些范围上的嵌套循环，它逐元素地应用 inner_fn 来产生输出。
+
+This is a define-by-run style IR. By running this IR, it’s executing Python that iterates and calls ops.load + ops.add. Inductor then generates the corresponding NVIDIA PTX code using the Triton JIT compiler and LLVM.
+
+这是一种随运行定义风格的 IR。运行这段 IR，实际上就是在执行进行迭代并调用 ops.load 与 ops.add 的 Python。随后，Inductor 会使用 Triton JIT 编译器和 LLVM 生成对应的 NVIDIA PTX 代码。
+
+> Use torch.library.wrap_triton with triton_op to register a Triton kernel as a first-class PyTorch op with autograd and fake-tensor support. This means you can write a Triton kernel and have TorchInductor optimize it as part of your model graph.
+
+> 使用 torch.library.wrap_triton 配合 triton_op，可以把一个 Triton 核函数注册为具备自动微分与伪张量（fake-tensor）支持的一等 PyTorch 算子。这意味着你可以编写一个 Triton 核函数，并让 TorchInductor 把它作为你模型图的一部分来优化。
+
+### Autotuning with TorchInductor
+
+### 使用 TorchInductor 进行自动调优
+
+TorchInductor includes an autotuner built on Triton’s autotuning capabilities, which we’ll describe in an upcoming section. The autotuner finds the best launch configuration for each generated GPU kernel. The autotuned configuration is cached per kernel so that subsequent runs don’t need to redo the tuning step.
+
+TorchInductor 内置了一个基于 Triton 自动调优（autotuning）能力构建的自动调优器（我们将在后面的小节中介绍）。这个自动调优器会为每个生成的 GPU 核函数找到最佳的启动配置。自动调优得到的配置会按核函数分别缓存，使得后续运行无需重做调优步骤。
+
+The first time you compile code with the TorchInductor backend, it will spend extra time benchmarking different kernel variants using different block sizes, tile sizes, etc. Inductor picks the fastest variant and uses this going forward. Kernel autotuning increases initial compile-time latency, but the resulting kernels are highly optimized for runtime.
+
+第一次用 TorchInductor 后端编译代码时，它会花费额外时间，使用不同的块大小、分块大小等对各种核函数变体进行基准测试。Inductor 会挑选最快的变体并在之后一直使用它。核函数自动调优会增加初始的编译时延迟，但由此得到的核函数在运行时高度优化。
+
+> If you recall from the last chapter, this aggressive autotuning is described as the max-autotune compiler mode. This is the most time-consuming compiler mode—and this is what’s happening under the hood.
+
+> 如果你还记得上一章的内容，这种激进的自动调优被称为 max-autotune 编译器模式。这是最耗时的编译器模式——而这正是其底层所发生的事情。
+
+Beyond kernel fusion and autotuning, TorchInductor applies many low-level optimizations. These include index simplification to reduce complex index arithmetic in loops, common-subexpression elimination within the generated code, and efficient memory planning to reuse buffers and reduce allocations.
+
+除了核函数融合与自动调优，TorchInductor 还会施加许多底层优化。这些优化包括：用于减少循环中复杂索引运算的索引化简、生成代码内部的公共子表达式消除，以及用于复用缓冲区、减少分配的高效内存规划。
+
+TorchInductor also uses CUDA Graphs to capture sequences of kernels at runtime for faster graph replay with minimal CPU overhead. By default, Inductor will try to wrap its generated kernels into a CUDA Graph to reduce launch overhead on each iteration. This is especially beneficial for inference—or when running any code or model with many kernels.
+
+TorchInductor 还使用 CUDA Graphs 在运行时捕获核函数序列，以极小的 CPU 开销实现更快的图重放。默认情况下，Inductor 会尝试把它生成的核函数包进一个 CUDA Graph，以减少每次迭代的启动开销。这对推理尤其有利——或者在运行任何含有大量核函数的代码或模型时也是如此。
+
+> The reduce-overhead and max-autotune compiler modes, described in Chapter 13, trigger the use of CUDA Graphs. However, CUDA Graphs require static shapes, so they are not used when dynamic-shape compilation is enabled. Said differently, if dynamic shapes are enabled with dynamic=True, TorchInductor will not use CUDA Graphs. Also, you can use max-autotune-no-cudagraphs when you need autotuning without CUDA Graph capture. In general, start with the default mode and use max-autotune to provide additional speedup for large/critical workloads as the expense of significant compile time. You may not see much benefit for smaller models.
+
+> 第 13 章介绍的 reduce-overhead 与 max-autotune 编译器模式会触发对 CUDA Graphs 的使用。然而，CUDA Graphs 要求静态形状，因此在启用动态形状编译时不会使用它们。换句话说，如果用 dynamic=True 启用了动态形状，TorchInductor 就不会使用 CUDA Graphs。此外，当你需要自动调优但不想进行 CUDA Graph 捕获时，可以使用 max-autotune-no-cudagraphs。一般来说，先从默认模式开始，再用 max-autotune 以可观的编译时间为代价，为大型/关键工作负载提供额外加速。对于较小的模型，你可能看不到太多收益。
+
+The end result of TorchInductor is highly optimized, device-specific code for your workload. In many cases, Inductor achieves performance close to, or even exceeding, hand-tuned libraries. For instance, Inductor can fuse an entire sequence of elementwise operations, including activations and pointwise transformations, into a single kernel. It can even fuse certain patterns of matrix multiplication followed by elementwise operations like bias-add + activation into one launch. This is relatively difficult to do by hand—and requires ongoing maintenance.
+
+TorchInductor 的最终产物是为你的工作负载生成的、高度优化的设备专用代码。在许多情况下，Inductor 能达到接近、甚至超过手工调优库的性能。例如，Inductor 可以把一整串逐元素操作（包括激活和逐点变换）融合进单个核函数；它甚至能把某些“矩阵乘法后接逐元素操作（如 bias-add + 激活）”的模式融合进一次启动。这类工作手工完成相对困难——而且需要持续维护。
+
+The PyTorch compiler uses heuristics and backends that may route certain operations (e.g., large GEMMs) to high-performance libraries such as cuBLAS/cuBLASLt or CUTLASS. It can even emit Triton kernels for fusable patterns. In practice, TorchInductor selects and caches whichever path performs best—or is known to be optimal for the given shapes.
+
+PyTorch 编译器使用启发式方法和后端，可能会把某些操作（如大型 GEMM（通用矩阵乘法，general matrix multiply））路由到 cuBLAS/cuBLASLt 或 CUTLASS 等高性能库，甚至能为可融合的模式发出 Triton 核函数。实际上，TorchInductor 会选择并缓存表现最佳——或已知对给定形状最优——的那条路径。
+
+For transformer models, TorchInductor will fuse the layernorm and residual connection elementwise operations around a large GEMM—while still using cuBLAS for the actual GEMM computation itself. Or, for models with irregular memory access, Inductor’s custom Triton kernel can outperform an existing library’s kernel by doing just the work that’s needed—and not benefit from a general-purpose library like cuBLAS or CUTLASS.
+
+对于 transformer 模型，TorchInductor 会把围绕大型 GEMM 的 layernorm 和残差连接逐元素操作融合起来——同时仍用 cuBLAS 来完成实际的 GEMM 计算本身。或者，对于内存访问不规则的模型，Inductor 的自定义 Triton 核函数可以只做必要的工作，从而胜过现有库的核函数——而这类情形并不能从 cuBLAS 或 CUTLASS 这样的通用库中获益。
+
+On modern GPUs, PyTorch’s compiler can work with NVIDIA’s Transformer Engine (TE) for certain transformer blocks and layers. However, PyTorch does not automatically substitute NVIDIA TE kernels when you call torch.compile. TE is a separate library that you must use explicitly via its modules or fused ops. But when you call TE APIs, torch.compile can compile and fuse around them. This complements the generated Triton kernels to provide maximum performance.
+
+在现代 GPU 上，PyTorch 编译器可以配合 NVIDIA 的 Transformer Engine（TE）处理某些 transformer 块和层。不过，当你调用 torch.compile 时，PyTorch 并不会自动替换为 NVIDIA TE 核函数。TE 是一个独立的库，你必须通过它的模块或融合算子显式使用。但当你调用 TE API 时，torch.compile 可以围绕它们进行编译和融合。这与生成的 Triton 核函数相辅相成，以提供最高性能。
+
+> Make sure to install NVIDIA Transformer Engine only if you plan to call TE modules directly in your model—for example, transformer_engine.pytorch.layers. torch.compile will not automatically swap TE kernels into a plain PyTorch model.
+
+> 只有当你打算在模型中直接调用 TE 模块（例如 transformer_engine.pytorch.layers）时，才需要安装 NVIDIA Transformer Engine。torch.compile 不会自动把 TE 核函数替换进一个普通的 PyTorch 模型。
+
+In essence, TorchInductor does the heavy lifting of turning code and models into high-performance GPU kernels. With each PyTorch release, hardware coverage is expanding and new optimized techniques are emerging. For example, PyTorch provides FlexAttention, a new attention operator that TorchInductor can compile into fused kernels approaching FlashAttention performance. Specifically, FlexAttention’s fused kernels have been measured to reach up to ~85–90% of modern FlashAttention performance in both forward and backward passes, while allowing more flexibility including block-sparsity and custom masks. To enable the fast paths, set the following torch.backend.cuda attributes to True:
+
+本质上，TorchInductor 承担了把代码和模型转化为高性能 GPU 核函数的繁重工作。随着 PyTorch 的每次发布，硬件覆盖范围在扩大，新的优化技术也在不断涌现。例如，PyTorch 提供了 FlexAttention，这是一个新的注意力算子，TorchInductor 可以把它编译成接近 FlashAttention 性能的融合核函数。具体来说，经测量，FlexAttention 的融合核函数在前向和反向传播中都能达到现代 FlashAttention 性能的至多约 85–90%，同时提供更多灵活性，包括块稀疏（block-sparsity）和自定义掩码。要启用这些快速路径，请把下列 torch.backend.cuda 属性设为 True：
+
+```
+# Ensure SDPA fast paths are enabled
+torch.backends.cuda.enable_flash_sdp(True)
+torch.backends.cuda.enable_math_sdp(True)
+torch.backends.cuda.enable_mem_efficient_sdp(True)
+```
+
+```
+# Ensure SDPA fast paths are enabled
+torch.backends.cuda.enable_flash_sdp(True)
+torch.backends.cuda.enable_math_sdp(True)
+torch.backends.cuda.enable_mem_efficient_sdp(True)
+```
+
+When using torch.nn.attention.flex_attention, make sure your inputs meet the fast-path constraints. This way, TorchInductor can emit the fused Triton kernels.
+
+使用 torch.nn.attention.flex_attention 时，请确保你的输入满足快速路径的约束条件。这样，TorchInductor 才能发出融合的 Triton 核函数。
+
+TorchInductor and Triton support automated warp specialization on modern GPUs. The compiler will enable it selectively when it’s deemed beneficial. Warp specialization can be tuned using Triton meta-parameters such as num_consumer_groups and num_buffers_warp_spec. These optimizations further improve GEMM throughput. Triton’s automatic warp specialization supports TMA and tensor descriptor APIs on modern GPU targets including Blackwell (e.g., tcgen05).
+
+TorchInductor 和 Triton 在现代 GPU 上支持自动化的 warp 专门化（warp specialization）。编译器会在认为有益时有选择地启用它。warp 专门化可以通过 num_consumer_groups 和 num_buffers_warp_spec 等 Triton 元参数进行调优。这些优化会进一步提升 GEMM 吞吐量。Triton 的自动 warp 专门化在包括 Blackwell 在内的现代 GPU 目标上支持 TMA 和张量描述符 API（例如 tcgen05）。
+
+> It’s recommended to use descriptor-based tiled loads/stores to map to TMA and reduce register pressure. This method is preferred over manual tl.load loops.
+
+> 建议使用基于描述符的分块加载/存储来映射到 TMA 并降低寄存器压力。相比手写的 tl.load 循环，这种方法更受推荐。
+
+In short, many models run significantly faster with torch.compile, though the exact gains depend on your models’ characteristics. The first time you run torch.compile, you pay a compile and autotune cost, but subsequent runs use the cached graph and kernels for lightning-fast execution.
+
+简而言之，许多模型在使用 torch.compile 后运行得明显更快，尽管确切的收益取决于你模型的特性。第一次运行 torch.compile 时，你要付出编译与自动调优的成本，但后续运行会使用缓存的图和核函数，实现闪电般的执行速度。
+
+### Dynamic Shapes and Variable Sequence Lengths
+
+### 动态形状与可变序列长度
+
+A major challenge with LLM training and inference is the variable-sized sequence inputs. In traditional compilers and accelerators, varying shapes often cause recompilation or otherwise require padding inputs to a fixed, common size. This section discusses how dynamic shape tracing works in torch.compile to handle variable-length sequences.
+
+LLM 训练与推理的一大挑战在于序列输入的尺寸可变。在传统的编译器和加速器中，变化的形状往往会导致重新编译，否则就需要把输入填充到一个固定的公共尺寸。本节讨论 torch.compile 中的动态形状追踪如何处理变长序列。
+
+Fortunately, the PyTorch compiler stack is designed to handle dynamic shapes gracefully. Specifically, it allows models to accept different input sizes without recompiling every time by using the SymPy library to represent unknown dimensions symbolically, as we’ll cover in a bit.
+
+所幸，PyTorch 编译栈的设计能够优雅地处理动态形状。具体来说，它通过使用 SymPy 库以符号方式表示未知维度，使模型能够接受不同的输入尺寸而无需每次都重新编译，这一点我们稍后会讲到。
+
+The PyTorch compiler will automatically mark dimensions as dynamic if it observes changes in their size. TorchInductor starts with static assumptions and then generalizes on recompile if it detects shape variability. You typically see one extra compile for the first new shape. By setting the dynamic=True flag upfront, you will force the compiler to consider all dimensions as dynamic from the start. However, remember that setting dynamic=True will disable CUDA Graphs. Prefer marking the code with only known varying dimensions using torch._dynamo.mark_dynamic().
+
+如果观察到某些维度的大小发生变化，PyTorch 编译器会自动把它们标记为动态。TorchInductor 一开始采用静态假设，之后若检测到形状可变，便会在重新编译时进行泛化。对于第一个新形状，你通常会看到一次额外编译。通过预先设置 dynamic=True 标志，你会强制编译器从一开始就把所有维度都视为动态。不过请记住，设置 dynamic=True 会禁用 CUDA Graphs。更推荐的做法是只用 torch._dynamo.mark_dynamic() 标记代码中已知会变化的维度。
+
+TorchDynamo and TorchInductor insert a guard-like sequence_length <= 256 (or whatever range you specify) during tracing on dynamic dimensions to generate code that works for a variety and range of sizes. For instance, if an output size is x.size(0) + y.size(0), Inductor can represent that as a symbolic expression and ensure the generated code works for any values that satisfy the guard conditions.
+
+TorchDynamo 和 TorchInductor 会在追踪动态维度时插入类似 sequence_length <= 256（或你指定的任意范围）这样的保护条件，以生成能适配多种尺寸及尺寸范围的代码。例如，如果某个输出尺寸为 x.size(0) + y.size(0)，Inductor 可以把它表示为一个符号表达式，并确保生成的代码对任何满足保护条件的取值都能工作。
+
+When Dynamo encounters a new shape for sequence_length, it sets a new guard such as sequence_length <= 1024 and compiles the kernels under this new assumption—treating the dimension as dynamic from that point on. Later, if a longer sequence is seen that violates the guard, the compiler will recompile a new version of the graph that handles the larger range. Over time, it builds up a cache of compiled kernels for each different shape range.
+
+当 Dynamo 遇到 sequence_length 的新形状时，它会设置一个新的保护条件（如 sequence_length <= 1024），并在这个新假设下编译核函数——从那时起把该维度当作动态处理。之后，如果出现更长的序列而违反了该保护条件，编译器会重新编译一个能处理更大范围的新版本图。随着时间推移，它会为每个不同的形状范围逐步积累起一份已编译核函数的缓存。
+
+You can also manually mark expected dynamic dimensions on a tensor with torch._dynamo.mark_dynamic(tensor, dim) to preempt a recompile. You can also use torch.compiler.set_stance(), which lets you adjust how recompilations are handled. For instance, you can use an eager-on-recompile stance to fall back to eager mode after a certain number of recompiles. We’ll discuss best practices for avoiding recompiles in a bit.
+
+你也可以用 torch._dynamo.mark_dynamic(tensor, dim) 手动在张量上标记预期的动态维度，以提前避免一次重新编译。你还可以使用 torch.compiler.set_stance()，它让你能够调整如何处理重新编译。例如，你可以使用 eager-on-recompile 立场，在若干次重新编译之后回退到即时执行模式。避免重新编译的最佳实践我们稍后讨论。
+
+TorchInductor attempts to generalize shapes after the first recompilation instead of repeatedly specializing on each new shape. For instance, it will emit conditional code inside the generated kernel using an if statement so that one kernel works for a range of sequence_lengths without erroring out. This reduces the need for separate compilation for every single size.
+
+TorchInductor 会在首次重新编译之后尝试对形状做泛化处理，而不是针对每一个新形状反复特化。例如，它会在生成的核函数内部用 if 语句发出条件代码，从而让同一个核函数能覆盖一段 sequence_lengths 区间而不报错。这样就减少了为每一种尺寸单独编译的必要。
+
+> Certain operations with data-dependent output ranks—or extremely complex indexing—may still trigger shape specialization. In these cases, the compiler will insert more guards—and if those are frequently violated, you might see frequent recompilations with mark_dynamic() or set_stance().
+
+> 某些具有数据相关输出秩（data-dependent output rank）——或极其复杂索引——的操作，仍可能触发形状特化。在这些情况下，编译器会插入更多保护条件；如果这些保护条件频繁失效，你可能会看到伴随 mark_dynamic() 或 set_stance() 出现的频繁重新编译。
+
+For context, a simple but inefficient way to handle variable-length sequences without supporting dynamic shapes is to pad all input sequences to the max length in the batch. This way, you can use one static computation for all inputs. While padding simplifies the implementation, it is inefficient when input lengths vary widely since a lot of compute is wasted on the meaningless padding tokens.
+
+作为背景，一种简单但低效地处理变长序列、又无需支持动态形状的做法，是把所有输入序列填充到批次中的最大长度。这样你就能对所有输入使用同一套静态计算。虽然填充简化了实现，但当输入长度差异很大时它非常低效，因为大量算力被浪费在毫无意义的填充 token 上。
+
+Padding can hurt GPU utilization if the maximum length is much bigger than the average length of all the inputs. With dynamic shape-compilation, however, we can let the compiler generate code that only iterates up to the actual sequence length of each input. Dynamic shapes let you avoid excessive padding for variable lengths.
+
+如果最大长度远大于所有输入的平均长度，填充会损害 GPU 利用率。然而借助动态形状编译，我们可以让编译器生成只迭代到每个输入实际序列长度的代码。动态形状让你避免为变长输入做过度填充。
+
+Let’s look at a typical text-based generative AI scenario in which sequence lengths continue to grow as the generation progresses. Compiling with dynamic shapes can consistently outperform eager execution—even as sequence length increases.
+
+我们来看一个典型的基于文本的生成式 AI 场景：随着生成过程推进，序列长度会不断增长。使用动态形状编译能够持续优于即时执行——即便序列长度不断增加。
+
+In contrast, if one were to pad everything to a power-of-two length to use static shapes, it would introduce a lot of wasted computation and increase compile time due to larger tensor sizes. In other words, using dynamic shapes provides better compile-time performance and runtime performance and easier usage since you don’t have to manually pad the inputs.
+
+相反，如果为了使用静态形状而把所有输入都填充到 2 的幂次长度，就会引入大量被浪费的计算，并因张量尺寸更大而增加编译时间。换句话说，使用动态形状能带来更好的编译期性能与运行期性能，且使用更简单，因为你不必手动填充输入。
+
+> It’s recommended to bucket inputs by size in order to limit the number of distinct shapes. This will enable dynamic shapes for the remaining variability. This hybrid approach avoids excessive recompilations while still reducing padding waste.
+
+> 建议按尺寸对输入分桶（bucket），以限制不同形状的数量。这样就能对剩余的变化范围启用动态形状。这种混合方法既避免了过度的重新编译，又减少了填充浪费。
+
+With dynamic shapes, you can compile once and use the same compiled model on inputs of different shapes. If the variations are within the supported range, one compiled model can handle multiple configurations.
+
+有了动态形状，你可以只编译一次，然后在不同形状的输入上复用同一个已编译模型。只要这些变化落在支持的范围内，一个已编译模型就能处理多种配置。
+
+Internally, TorchInductor uses the SymPy library to represent dynamic dimensions symbolically. It will propagate these symbols through the IR so that an expression like z.size(0) = x.size(0) + y.size(0) can be handled symbolically. Inductor will reduce conditions to guard expressions.
+
+在内部，TorchInductor 使用 SymPy 库以符号方式表示动态维度。它会把这些符号沿 IR 传播，从而使 z.size(0) = x.size(0) + y.size(0) 这样的表达式能被符号化地处理。Inductor 会把各种条件归约为保护表达式。
+
+If a guard fails because the dimension fell outside an expected range—or a data-dependent condition changed, Inductor will trigger a recompile. In essence, TorchInductor attempts to compile a general kernel for a range of sizes instead of a single fixed size.
+
+如果某个保护条件因维度落在预期范围之外——或某个数据相关条件发生变化——而失效，Inductor 就会触发一次重新编译。本质上，TorchInductor 试图为一段尺寸区间编译出一个通用核函数，而不是只针对单一固定尺寸。
+
+Dynamic shape has significantly improved in recent releases. However, certain operations may force shape specialization if the compiler can’t handle them symbolically. In this case, the compiler might insert more guards, which, if violated often, could lead to frequent recompilations and negate the benefits of compiling.
+
+动态形状在近期版本中已显著改进。不过，如果编译器无法对某些操作做符号化处理，这些操作仍可能强制形状特化。在这种情况下，编译器可能插入更多保护条件；若这些条件频繁失效，就会导致频繁重新编译，从而抵消编译带来的收益。
+
+Data-dependent control flow still triggers specialization. Use dynamic shapes for varying sequence lengths but not for truly data-dependent branches.
+
+数据相关的控制流仍会触发特化。对变化的序列长度使用动态形状，但不要用于真正数据相关的分支。
+
+It’s worth noting that as of this writing, CUDA Graph replay requires static shapes (and fixed memory addresses). And only limited parameter updates are supported on instantiated graphs. Memory addresses and kernel-launch topology must remain compatible with capture. As such, enabling dynamic shapes will typically disable graph capture for those regions. This prevents the compiler from gaining the performance benefits of CUDA Graphs, including reduced kernel-launch overhead.
+
+值得注意的是，在撰写本书时，CUDA Graph 回放要求静态形状（以及固定的内存地址）。而且对已实例化的图仅支持有限的参数更新。内存地址与核函数启动拓扑必须与捕获时保持兼容。因此，启用动态形状通常会禁用这些区域的图捕获。这会使编译器无法获得 CUDA Graph 带来的性能收益，包括降低核函数启动开销。
+
+> If you specify the reduce-overhead compiler mode but also set dynamic=True, the CUDA Graph optimization from reduce-overhead won’t apply since you are specifying that the shapes can vary. Enabling dynamic shapes will change guards and memory planning, which will disable graph capture. In practice, use mode="reduce-overhead" only with stable shapes to get CUDA Graphs. For variable sequence lengths, prefer mode="default" or mode="max-autotune-no-cudagraphs" and bucket/pad within ±10–20% to limit recompiles.
+
+> 如果你指定了 reduce-overhead 编译模式却又设置了 dynamic=True，那么 reduce-overhead 提供的 CUDA Graph 优化将不会生效，因为你已声明形状可以变化。启用动态形状会改变保护条件与内存规划，进而禁用图捕获。实践中，只在形状稳定时使用 mode="reduce-overhead" 以获得 CUDA Graph。对于可变序列长度，优先选择 mode="default" 或 mode="max-autotune-no-cudagraphs"，并在 ±10–20% 范围内分桶/填充以限制重新编译。
+
+It’s recommended to profile your system to see if dynamic shapes are worth using for your use case. In certain cases, it might be better to pad to a fixed size, use static shapes with CUDA Graphs, and achieve higher throughput by not having to recompile for each unique length. In other cases, dynamic shapes will be better.
+
+建议对你的系统做剖析，判断动态形状对你的用例是否值得启用。在某些情况下，填充到固定尺寸、配合 CUDA Graph 使用静态形状，并通过免去为每个唯一长度重新编译来获得更高吞吐，可能是更好的选择。在另一些情况下，动态形状则更优。
+
+You should profile different approaches to find what works best for you. When you do this, be sure to monitor memory usage. Code that supports dynamic shapes will incur a slightly higher memory footprint due to the additional guards and generalized code needed for the maximum range.
+
+你应当剖析不同的方案，找出最适合你的做法。在这样做时，务必监控内存使用。支持动态形状的代码会因需要额外的保护条件和为最大区间生成的通用代码，而带来略高的内存占用。
+
+> A rule of thumb is that if your sequence lengths vary by only 10%–20%, you will likely benefit from fixed-length padding.
+
+> 一条经验法则是：如果你的序列长度只有 10%–20% 的波动，那么定长填充很可能对你更有利。
+
+In short, dynamic shape support means you don’t have to disable torch.compile for variable-length inputs common in LLM models. By supporting dynamic shapes, the PyTorch compiler can perform kernel fusion and other optimizations across different input sizes.
+
+简而言之，支持动态形状意味着你不必为 LLM 模型中常见的变长输入而禁用 torch.compile。通过支持动态形状，PyTorch 编译器能够跨不同输入尺寸执行核函数融合与其他优化。
+
+### Disabling the PyTorch Compiler and Reverting Back to Eager Mode
+
+### 禁用 PyTorch 编译器并回退到即时执行模式
+
+If you want to completely disable torch.compile without changing your code—useful for A/B testing performance and isolating issues—you can use the @torch.compiler.disable decorator to disable compilation for that function. For region-scoped control, use torch.compiler.set_stance() as a context manager. This will force the code to run in eager mode. For example, you might want to disable compilation for complex data loading or one-time initialization logic to keep the compiled graph focused on computations. This is also useful around code that does not work well with tracing, as we’ll cover in a bit.
+
+如果你想在不改动代码的情况下完全禁用 torch.compile——这对性能 A/B 测试和隔离问题很有用——可以用 @torch.compiler.disable 装饰器来禁用该函数的编译。若需区域级作用域控制，可以把 torch.compiler.set_stance() 当作上下文管理器使用。这会强制代码以即时执行模式运行。例如，你可能希望对复杂的数据加载或一次性的初始化逻辑禁用编译，让已编译的图专注于计算部分。这对处理那些与追踪（tracing）配合不佳的代码同样有用，我们稍后会讲到。
+
+Or, you can simply change to use the eager backend as follows: torch.compile(model, backend="eager"). This will revert your code to run in eager mode. This lets you easily debug and compare correctness/performance results between compiled and eager modes.
+
+或者，你也可以像下面这样直接改用 eager 后端：torch.compile(model, backend="eager")。这会让你的代码回退到即时执行模式运行。这样你就能轻松地在已编译模式与即时执行模式之间调试并比较正确性/性能结果。
+
+torch.compiler.disable() and torch.compiler.set_stance() are a valuable escape hatches when certain operations don’t work with PyTorch compile—or you simply don’t want them in the graph for performance reasons. Speaking of performance, let’s explore ways to improve the performance of our compiled graphs and code using the PyTorch compiler logs.
+
+torch.compiler.disable() 与 torch.compiler.set_stance() 是宝贵的“逃生舱”，可用于某些操作无法与 PyTorch 编译配合工作——或你仅仅出于性能原因不想让它们进入图中的场景。说到性能，接下来我们就来探讨如何利用 PyTorch 编译器日志改进已编译图与代码的性能。
+
+### Performance Hints and Debugging Generated Code
+
+### 性能提示与调试生成的代码
+
+Another extremely useful logging option to enable is TORCH_LOGS="perf_hints". These logs will show you missed performance-optimization opportunities. For example, if a certain pattern could not be fused—or if a CUDA Graph could not be used—it will log a hint like “*PerfHint: CUDA Graph not used because input is mutated*” or “*PerfHint: fell back to eager for random op*,” etc. These hints guide you on what might be limiting the performance of your code or model.
+
+另一个极其有用、值得启用的日志选项是 TORCH_LOGS="perf_hints"。这些日志会向你展示错失的性能优化机会。例如，如果某个模式无法被融合——或某个 CUDA Graph 无法被使用——它会记录一条提示，如“*PerfHint: CUDA Graph not used because input is mutated*”或“*PerfHint: fell back to eager for random op*”等。这些提示会指引你了解可能限制代码或模型性能的因素。
+
+For deeper performance debugging and tuning, you likely want to see the exact code that TorchInductor generates. There are a couple of ways to inspect the code. First, you can set TORCH_LOGS="output_code" to print the generated code for each compiled graph. This will show the raw source code for the generated kernels. You can even modify the source code and further optimize, if needed.
+
+要做更深入的性能调试与调优，你很可能想看到 TorchInductor 生成的确切代码。有几种方式可以检视这些代码。首先，你可以设置 TORCH_LOGS="output_code" 来打印每个已编译图生成的代码。这会显示所生成核函数的原始源代码。如有需要，你甚至可以修改源代码并进一步优化。
+
+You can also enable TorchInductor’s debug mode by setting TORCH_COMPILE_DEBUG=1. When you run your program with debug mode enabled, Inductor will create a debug directory (e.g., /tmp/torchinductor_<pid>/...) that contains the FX Graph (.fx), Inductor artifacts such as outputcode.py, *fx_graph_runnable.py*, IR dumps, and generated Triton sources.
+
+你还可以通过设置 TORCH_COMPILE_DEBUG=1 来启用 TorchInductor 的调试模式。当你在启用调试模式下运行程序时，Inductor 会创建一个调试目录（例如 /tmp/torchinductor_<pid>/...），其中包含 FX 图（.fx）、诸如 outputcode.py、*fx_graph_runnable.py* 等 Inductor 产物、IR 转储，以及生成的 Triton 源代码。
+
+When reading the generated .triton code, you may notice Triton-specific constructs —or even raw PTX in advanced cases. If you also inspect the compiled PTX in the debug artifacts, you may see mma.sync instructions where tl.dot is lowered to Tensor Core operations. These logs, tools, and artifacts are incredibly useful for performance tuning because they let you see exactly what the compiler is doing. Understanding these can help you verify that the compiler is applying optimizations like kernel fusion, warp specialization, or double buffering. If you spot an inefficiency, you can manually create a custom Triton kernel for your specific use case.
+
+在阅读生成的 .triton 代码时，你可能会注意到 Triton 特有的构造——在高级场景下甚至会看到原始 PTX。如果你还检视调试产物中已编译的 PTX，你可能会在 tl.dot 被下降为张量核心（Tensor Core）操作的地方看到 mma.sync 指令。这些日志、工具和产物对性能调优极其有用，因为它们让你精确看到编译器在做什么。理解这些内容有助于你确认编译器确实应用了核函数融合、warp 专门化或双缓冲（double buffering）等优化。如果你发现了低效之处，就可以针对你的具体用例手动编写一个自定义 Triton 核函数。
+
+> If you’re feeling benevolent, you can even contribute your custom kernel back to the PyTorch and Triton ecosystems since it’s likely that somebody else can benefit from your optimization.
+
+> 如果你乐于分享，甚至可以把你的自定义核函数贡献回 PyTorch 与 Triton 生态，因为很可能别人也能从你的优化中受益。
+
+### Debugging Numerical Correctness and Accuracy
+
+### 调试数值正确性与精度
+
+While very rare, it’s possible that torch.compile produces a result that is numerically different compared to eager mode. If you suspect a bug in the compiler, there are a few strategies to verify and collect data before notifying the community and creating a GitHub issue.
+
+尽管非常罕见，torch.compile 仍有可能产生与即时执行模式在数值上不同的结果。如果你怀疑编译器存在 bug，在向社区反馈并创建 GitHub issue 之前，有几种策略可用于验证并收集数据。
+
+First, you can use PyTorch’s minifier tools to create reproducible scripts. PyTorch has a TorchDynamo minifier tool and TorchInductor minifier tool, which will try to reduce your program to the smallest version that still reproduces the error. It’s very helpful to create a small, reproducible script for the PyTorch team to use if needed. You would attach this file to your GitHub issue if it gets to this point.
+
+首先，你可以使用 PyTorch 的 minifier 工具来创建可复现的脚本。PyTorch 提供了 TorchDynamo minifier 工具和 TorchInductor minifier 工具，它们会尝试把你的程序缩减到仍能复现该错误的最小版本。如有需要，为 PyTorch 团队创建一个小巧、可复现的脚本会非常有帮助。若真到了这一步，你就把这个文件附在你的 GitHub issue 上。
+
+Additionally, you can configure TorchDynamo to debug numerical accuracy at each layer of the compiler stack. To help determine where a numerical discrepancy is introduced, you can set the following environment variables during compilation to compare eager mode to the different compiler stages and isolate if the issue is in TorchDynamo, AOT Autograd, or TorchInductor:
+
+此外，你可以配置 TorchDynamo 在编译器栈的每一层调试数值精度。为帮助判断数值差异是在哪里引入的，你可以在编译期间设置以下环境变量，将即时执行模式与不同编译阶段进行比较，从而隔离问题究竟出在 TorchDynamo、AOT Autograd 还是 TorchInductor：
+
+```
+# Dump the outputs after each compilation stage
+TORCHDYNAMO_REPRO_AFTER="aot"
+TORCHDYNAMO_REPRO_LEVEL=4
+```
+
+```
+# Dump the outputs after each compilation stage
+TORCHDYNAMO_REPRO_AFTER="aot"
+TORCHDYNAMO_REPRO_LEVEL=4
+```
+
+These settings will cause TorchDynamo to dump the graph after each stage—and run each graph in eager mode for comparison. This can help pinpoint which stage introduced the error.
+
+这些设置会让 TorchDynamo 在每个阶段之后转储图——并以即时执行模式运行每个图以作对比。这有助于精确定位是哪个阶段引入了错误。
+
+Specifically, setting TORCHDYNAMO_REPRO_AFTER="aot" tells TorchDynamo to dump the FX Graph and trigger the logic to generate a script to reproduce the error after the AOT Autograd stage. This is in contrast to generating the reproduction script after the initial Dynamo capture.
+
+具体来说，设置 TORCHDYNAMO_REPRO_AFTER="aot" 会告诉 TorchDynamo 在 AOT Autograd 阶段之后转储 FX 图，并触发生成复现该错误脚本的逻辑。这与在最初的 Dynamo 捕获之后生成复现脚本形成对比。
+
+Using TORCHDYNAMO_REPRO_LEVEL=4, TorchDynamo will run each dumped graph in eager mode and compare its outputs to the compiled version. This halts and saves a minimal reproduction script if any numeric mismatch is detected.
+
+使用 TORCHDYNAMO_REPRO_LEVEL=4，TorchDynamo 会以即时执行模式运行每个被转储的图，并将其输出与已编译版本进行比较。一旦检测到任何数值不匹配，它就会中止并保存一个最小复现脚本。
+
+> The PyTorch compiler team loves fixing correctness bugs, so if you do find a true error, report the issue on GitHub. Make sure to include the minified reproducible set of artifacts by setting TORCHDYNAMO_REPRO_AFTER="aot" and TORCHDYNAMO_REPRO_LEVEL=4.
+
+> PyTorch 编译器团队很乐意修复正确性 bug，所以如果你确实发现了真正的错误，请在 GitHub 上报告该问题。务必通过设置 TORCHDYNAMO_REPRO_AFTER="aot" 和 TORCHDYNAMO_REPRO_LEVEL=4 来附上已最小化的可复现产物集。
+
+If using random numbers (seeds) or sequences, you should make sure they are being generated consistently. By default, TorchInductor might not produce the exact same random seed or sequence as with eager mode. One reason is that fused or reordered kernels may not generate numbers in the same, expected order as eager mode.
+
+如果使用随机数（种子）或随机序列，你应确保它们被一致地生成。默认情况下，TorchInductor 可能不会产生与即时执行模式完全相同的随机种子或序列。原因之一是，被融合或被重排的核函数可能不会按即时执行模式那样预期的顺序生成数字。
+
+If needed, you can set torch._inductor.config.fallback_random=True to force TorchInductor to generate random numbers exactly like it would with eager mode. This will incur a slight performance hit, but it may be required for numerical correctness when using the PyTorch compiler.
+
+如有需要，你可以设置 torch._inductor.config.fallback_random=True，强制 TorchInductor 完全像即时执行模式那样生成随机数。这会带来轻微的性能损失，但在使用 PyTorch 编译器时，为保证数值正确性（numerical correctness）它可能是必要的。
+
+Numerical differences can also stem from floating-point precision. For example, if you use PyTorch automatic mixed precision (AMP) or BF16, the order of operations in a fused kernel might introduce slight numerical differences versus eager’s unfused sequence.
+
+数值差异也可能源自浮点精度。例如，如果你使用 PyTorch 自动混合精度（automatic mixed precision，AMP）或 BF16，融合核函数中的运算顺序可能与即时执行未融合的序列相比引入细微的数值差异。
+
+While such differences rarely affect convergence, they can in some cases. If you suspect precision-related instability, try disabling torch.compile and run the model in full FP32 to isolate the issue. You can also use torch.set_float32_matmul_precision('highest') to control TF32 usage and the accuracy-performance trade-off for full FP32 matmuls and maximum numerical accuracy.
+
+虽然这类差异很少影响收敛，但在某些情况下确实会。如果你怀疑存在与精度相关的不稳定，可以尝试禁用 torch.compile，并以完整 FP32 运行模型以隔离问题。你还可以使用 torch.set_float32_matmul_precision('highest') 来控制 TF32 的使用，以及在完整 FP32 矩阵乘法与最大数值精度之间权衡精度与性能。
+
+It’s also important to understand that small discrepancies may arise from using mixed precision (e.g., FP16/BF16). You can enforce deterministic behavior by setting torch.use_deterministic_algorithms(True). This causes PyTorch to throw an error if a nondeterministic operation is used. While torch.compile does reduce some sources of nondeterminism by design, it’s still good practice to enable this flag during debugging.
+
+同样重要的是要理解，使用混合精度（例如 FP16/BF16）可能带来细小差异。你可以通过设置 torch.use_deterministic_algorithms(True) 来强制确定性行为。这会使 PyTorch 在使用非确定性操作时抛出错误。虽然 torch.compile 在设计上确实减少了一些非确定性来源，但在调试期间启用此标志仍是良好实践。
+
+Keep in mind, however, that not all operations have deterministic implementations. For example, the default torch.matmul() operation that relies on cuBLAS does not have a deterministic implementation.
+
+不过要记住，并非所有操作都有确定性实现。例如，依赖 cuBLAS 的默认 torch.matmul() 操作就没有确定性实现。
+
+Specifically, the cuBLAS implementation relies on parallel optimizations like split-K, which can reduce operations in varying orders. This results in floating-point results that aren’t bitwise reproducible across runs.
+
+具体来说，cuBLAS 实现依赖 split-K 之类的并行优化，这可能以不同顺序归约操作。其结果是浮点结果在多次运行之间无法按位复现。
+
+As such, enabling this setting may cause your code to fail unless there is a fallback alternative available. To enforce full determinism for cuBLAS-dependent operations like torch.matmul(), you need to call torch.use_deterministic_algorithms(True) and set the CUBLAS_WORKSPACE_CONFIG to a fixed size, as shown here:
+
+因此，启用此设置可能导致你的代码失败，除非存在可用的回退替代方案。要对像 torch.matmul() 这类依赖 cuBLAS 的操作强制完全确定性，你需要调用 torch.use_deterministic_algorithms(True) 并将 CUBLAS_WORKSPACE_CONFIG 设置为固定大小，如下所示：
+
+```
+# Set this before starting the Python/PyTorch process
+export CUBLAS_WORKSPACE_CONFIG=:4096:8   # or :16:8
+# Use this with the PyTorch process
+torch.use_deterministic_algorithms(True)
+```
+
+```
+# Set this before starting the Python/PyTorch process
+export CUBLAS_WORKSPACE_CONFIG=:4096:8   # or :16:8
+# Use this with the PyTorch process
+torch.use_deterministic_algorithms(True)
+```
+
+Here, the first value (e.g., 4096 or 16) selects the size of the cuBLAS workspace buffer in bytes rounded to an internal bucket. The second value (e.g., 8) selects how many such buffers are reserved. Set either :4096:8 or :16:8 as documented to enforce deterministic algorithms.
+
+这里，第一个值（例如 4096 或 16）选择 cuBLAS 工作区缓冲的字节大小，并舍入到某个内部分桶。第二个值（例如 8）选择保留多少个这样的缓冲。按文档所述设置为 :4096:8 或 :16:8 以强制使用确定性算法。
+
+To force cuBLAS to use deterministic algorithms under torch.use_deterministic_algorithms(True), set CUBLAS_WORKSPACE_CONFIG to a supported value like :4096:8 or :16:8, as documented. If you enforce determinism without setting this, PyTorch will raise at runtime for operations that would otherwise select nondeterministic cuBLAS algorithms.
+
+要在 torch.use_deterministic_algorithms(True) 下强制 cuBLAS 使用确定性算法，请按文档将 CUBLAS_WORKSPACE_CONFIG 设置为受支持的值，如 :4096:8 或 :16:8。如果你强制确定性却不设置此项，PyTorch 会在运行时对那些原本会选择非确定性 cuBLAS 算法的操作抛出错误。
+
+> Always test determinism on your actual hardware and model configuration to confirm reproducibility.
+
+> 请始终在你的实际硬件和模型配置上测试确定性，以确认可复现性。
+
+Also, for critical workloads, you might temporarily disable certain compiler optimizations by setting flags like torch._inductor.config.triton.cudagraphs=False to better isolate the cause of a discrepancy. This disables CUDA Graph capture for TorchInductor-generated Triton kernels.
+
+此外，对于关键工作负载，你可以通过设置诸如 torch._inductor.config.triton.cudagraphs=False 之类的标志，临时禁用某些编译器优化，以便更好地隔离差异的成因。这会禁用对 TorchInductor 生成的 Triton 核函数的 CUDA Graph 捕获。
+
+Debugging PyTorch compiler optimizations requires a slightly different mindset since you’re looking at the meta-level execution steps through logs and graph visualizations—in addition to the low-level generated code. Tools like torch._dynamo.explain() give a high-level overview of how your code is converted into graphs, graph breaks, and subgraphs, while the various TORCH_LOGS options let you peek into the decisions that the compiler makes—as well as the exact code that it generates.
+
+调试 PyTorch 编译器优化需要略有不同的思维方式，因为除了底层生成的代码之外，你还要透过日志和图可视化审视元层面（meta-level）的执行步骤。像 torch._dynamo.explain() 这样的工具能提供代码如何被转换为图、图中断与子图的高层概览，而各种 TORCH_LOGS 选项则让你得以窥见编译器所做的决策——以及它生成的确切代码。
+
+In short, with these combined tools and debugging mechanisms, you can iteratively eliminate graph breaks and make sure your model and code are fully captured and optimized. The payoff is worth it, as a well-compiled model can significantly outperform its eager-execution counterpart—especially for large LLM architectures in which every bit of performance improvement will add up.
+
+简而言之，借助这些组合起来的工具与调试机制，你可以迭代地消除图中断，并确保你的模型和代码被完整捕获与优化。这份付出是值得的，因为一个编译良好的模型能显著优于其即时执行的对应版本——尤其是对大型 LLM 架构而言，每一点性能提升都会累积起来。
+
+## Explaining and Minimizing Graph Breaks
+
+## 解释与最小化图中断
+
+When using torch.compile, diagnosing performance and correctness requires specialized tools. In this section, we’ll show you how to use various tools and best practices to debug and pinpoint excessive graph breaks. These include torch._dynamo.explain(), environment variables to log compiler decisions, and best practices for debugging both the captured graphs and the kernels that they generate.
+
+在使用 torch.compile 时，诊断性能与正确性需要专门的工具。在本节中，我们将向你展示如何使用各种工具与最佳实践来调试并精确定位过多的图中断。这些工具包括 torch._dynamo.explain()、用于记录编译器决策的环境变量，以及调试所捕获的图与它们所生成核函数的最佳实践。
+
+### Graph Breaks and TorchDynamo explain()
+
+### 图中断与 TorchDynamo explain()
+
+A graph break occurs when TorchDynamo cannot continue capturing a continuous sequence of operations into a single graph. When this happens, it falls back to eager execution for this part of the code.
+
+当 TorchDynamo 无法继续把一段连续的操作序列捕获进单个图时，就会发生图中断。发生这种情况时，它会对这部分代码回退到即时执行。
+
+Graph breaks are the enemy of performance. Each break means an optimized graph is cut short—and more Python overhead is introduced. If you compile a model and see only modest speedups, it may be caused by frequent graph breaks that are preventing large, fused graphs. Ideally, we want as few breaks as possible—ideally one large graph for the whole model or whole training step.
+
+图中断是性能的大敌。每一次中断都意味着一个优化过的图被截断——并引入更多 Python 开销。如果你编译了一个模型却只看到不大的加速，很可能是频繁的图中断阻止了大型融合图的形成。理想情况下，我们希望中断越少越好——最好整个模型或整个训练步骤只有一个大图。
+
+Complex graphs that involve collective communications (e.g., all-gather, reduce-scatter, etc.) often require graph breaks. Figure 14-5 shows the graph breaks in PyTorch’s FSDP strategy due to collective communication.
+
+涉及集合通信（例如 all-gather、reduce-scatter 等）的复杂图往往需要图中断。图 14-5 展示了 PyTorch FSDP 策略中由集合通信导致的图中断。
+
+![Figure 14-5. Graph breaks in PyTorch FSDP caused by communication layers (source: https://oreil.ly/TJW42)](AI%20Systems%20Performance%20Engineering-ch14_images/figure-14-5.png)
+
+![图 14-5. PyTorch FSDP 中由通信层引起的图中断（来源：https://oreil.ly/TJW42）](AI%20Systems%20Performance%20Engineering-ch14_images/figure-14-5.png)
+
+PyTorch provides torch._dynamo.explain() to help analyze and debug graph breaks. When invoking this debugging function with your model and example inputs, it will run the model within TorchDynamo and return a report of how many graphs were generated, where the breaks occurred, and why they happened, as shown here, followed by the detailed graph-break analysis and explanation:
+
+PyTorch 提供了 torch._dynamo.explain() 来帮助分析和调试图中断。当你用你的模型和示例输入调用这个调试函数时，它会在 TorchDynamo 内运行该模型，并返回一份报告，说明生成了多少个图、中断发生在何处、以及它们为何发生，如下所示，随后附上详细的图中断分析与解释：
+
+```
+import torch._dynamo as dynamo
+def toy_example(a, b):
+    x = a / (torch.abs(a) + 1)
+    print("woo")         # a print statement in the model
+    if b.sum() < 0:      # dynamic control flow depending on data
+        b = -b
+    return x * b
+explanation = dynamo.explain(toy_example)(torch.randn(10), torch.randn(10))
+print(explanation)
+Graph Count: 3
+Graph Break Count: 2
+Op Count: 5
+Break Reasons:
+  Break Reason 1:
+    Reason: builtin: print [...ConstantVariable] False
+    User Stack:
+      <frame at toy_example: line 3, in toy_example>
+  Break Reason 2:
+    Reason: generic_jump TensorVariable()
+    User Stack:
+      <frame at toy_example: line 5, in toy_example>
+Ops per Graph:
+  ...
+```
+
+```
+import torch._dynamo as dynamo
+def toy_example(a, b):
+    x = a / (torch.abs(a) + 1)
+    print("woo")         # a print statement in the model
+    if b.sum() < 0:      # dynamic control flow depending on data
+        b = -b
+    return x * b
+explanation = dynamo.explain(toy_example)(torch.randn(10), torch.randn(10))
+print(explanation)
+Graph Count: 3
+Graph Break Count: 2
+Op Count: 5
+Break Reasons:
+  Break Reason 1:
+    Reason: builtin: print [...ConstantVariable] False
+    User Stack:
+      <frame at toy_example: line 3, in toy_example>
+  Break Reason 2:
+    Reason: generic_jump TensorVariable()
+    User Stack:
+      <frame at toy_example: line 5, in toy_example>
+Ops per Graph:
+  ...
+```
+
+Here, the explanation shows that TorchDynamo splits the code into three graph segments across two graph breaks. Note the “User Stack” portions of the output that point to the specific line of code where the issue happens. This is very useful for pinpointing the code causing the graph break.
+
+这里，这份解释显示 TorchDynamo 将代码分割为三个图段，中间有两次图中断。注意输出中的“User Stack”部分，它指向问题发生的具体代码行。这对于精确定位导致图中断的代码非常有用。
+
+The first break is caused by the print("woo") near line 3. Because print() has a “side effect” of writing text to stdio, it isn’t capturable. As such, Dynamo breaks the graph into two graphs: before and after the print().
+
+第一次中断由第 3 行附近的 print("woo") 引起。由于 print() 具有向 stdio 写入文本的“副作用”，它无法被捕获。因此，Dynamo 把图拆分为两个图：print() 之前与之后。
+
+The second graph break is caused by the dynamic control flow logic if b.sum() < 0: near line 5, which Dynamo couldn’t handle in a single graph because of the data-dependent dynamic control flow logic used in this specific scenario—and mentioned as a limitation in a previous section.
+
+第二次图中断由第 5 行附近的数据相关控制流逻辑 if b.sum() < 0: 引起。由于这一特定场景中使用了数据相关的动态控制流逻辑，Dynamo 无法在单个图中处理它——这也是前一节提到的一项限制。
+
+Using dynamo.explain() on your model—with representative inputs—is one of the first things to do if you’re not getting the performance you expect from the PyTorch compiler. It gives you a quick overview of how many graphs were made—and why it couldn’t make just one large graph.
+
+在你没有从 PyTorch 编译器获得预期性能时，对你的模型——配以有代表性的输入——运行 dynamo.explain() 是首先要做的事情之一。它能让你快速概览生成了多少个图——以及为何无法只生成一个大图。
+
+Once you understand the causes, you can refactor the code to address the graph breaks one by one. In the preceding example, you can remove the print() or wrap it in a guard such as if not torch._dynamo.is_compiling() to avoid executing during tracing, as shown here:
+
+一旦你理解了成因，就可以重构代码，逐个解决图中断。在前面的例子中，你可以移除 print()，或用诸如 if not torch._dynamo.is_compiling() 之类的保护把它包起来，以避免在追踪期间执行，如下所示：
+
+```
+import torch
+def model(a, b):
+    x = a / (torch.abs(a) + 1)
+    # avoid during compiling/tracing
+    if not torch._dynamo.is_compiling():
+        print("do not print during tracing/compiling")
+    if b.sum() < 0:
+        b = -b
+    return x * b
+explanation = dynamo.explain(model)(torch.randn(10),
+  torch.randn(10))
+print(explanation)
+```
+
+```
+import torch
+def model(a, b):
+    x = a / (torch.abs(a) + 1)
+    # avoid during compiling/tracing
+    if not torch._dynamo.is_compiling():
+        print("do not print during tracing/compiling")
+    if b.sum() < 0:
+        b = -b
+    return x * b
+explanation = dynamo.explain(model)(torch.randn(10),
+  torch.randn(10))
+print(explanation)
+```
+
+As mentioned earlier, if your model truly needs data-dependent branches, you can wrap them in torch.cond(). This will capture both the “true” and “false” branches as graph subroutines, as shown here:
+
+如前所述，如果你的模型确实需要数据相关的分支，你可以把它们包在 torch.cond() 中。这会把“真”分支和“假”分支都捕获为图子例程，如下所示：
+
+```
+import torch
+def model_cond(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    # Compute x as before
+    x = a / (torch.abs(a) + 1)
+    # Retain the compile-time check as a
+    #   Python-level guard
+    # Avoid side-effects during tracing/compilation
+    if not torch._dynamo.is_compiling():
+        print("do not print during tracing/compiling")
+    # Handle the data-dependent sign flip on b
+    b = torch.cond(
+        b.sum() < 0,  # predicate (0-dim bool tensor)
+        lambda b: -b, # true_fn: flip sign
+        lambda b: b,  # false_fn: leave unchanged
+        (b,)          # operands tuple
+    )
+    return x * b
+# Generate and print the Dynamo explanation just like before
+explanation = dynamo.explain(model_cond)(torch.randn(10), torch.randn(10))
+print(explanation)
+```
+
+```
+import torch
+def model_cond(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    # Compute x as before
+    x = a / (torch.abs(a) + 1)
+    # Retain the compile-time check as a
+    #   Python-level guard
+    # Avoid side-effects during tracing/compilation
+    if not torch._dynamo.is_compiling():
+        print("do not print during tracing/compiling")
+    # Handle the data-dependent sign flip on b
+    b = torch.cond(
+        b.sum() < 0,  # predicate (0-dim bool tensor)
+        lambda b: -b, # true_fn: flip sign
+        lambda b: b,  # false_fn: leave unchanged
+        (b,)          # operands tuple
+    )
+    return x * b
+# Generate and print the Dynamo explanation just like before
+explanation = dynamo.explain(model_cond)(torch.randn(10), torch.randn(10))
+print(explanation)
+```
+
+Here, the predicate b.sum() < 0 must be either a Python bool or a one-element torch.bool tensor. The true_fn and false_fn are callables taking the same operands (here, just (b,)) and returning tensors of the same shape and dtype.
+
+这里，谓词 b.sum() < 0 必须是一个 Python bool 或一个单元素的 torch.bool 张量。true_fn 与 false_fn 是接受相同操作数（此处即 (b,)）并返回形状和 dtype 相同的张量的可调用对象。
+
+This code keeps the Dynamo compile-time check (dynamo.is_compiling()) as a Python if since it’s not data-dependent at runtime and we want to avoid side-effects (e.g., print) during tracing.
+
+这段代码把 Dynamo 的编译期检查（dynamo.is_compiling()）保留为一个 Python if，因为它在运行时并非数据相关，而且我们希望避免在追踪期间产生副作用（例如 print）。
+
+Note that torch.cond() currently only accepts a tensor predicate, requires both branches to have the same inputs and return a single tensor of identical shape and dtype, and does not allow in-place mutations or arbitrary side-effects.
+
+注意，torch.cond() 目前只接受张量谓词，要求两个分支具有相同的输入并返回形状和 dtype 完全一致的单个张量，且不允许原地修改或任意副作用。
+
+In contrast, you can use a pure-tensor masking approach with torch.where(), as described earlier. This will impose no such restrictions and avoids graph breaks, making it the simpler, more reliable choice when you don’t need the full expressivity of torch.cond(). This code is shown here:
+
+相比之下，你可以像前面描述的那样，使用 torch.where() 的纯张量掩码方法。这不会带来上述任何限制，也能避免图中断，因此在你不需要 torch.cond() 的完整表达能力时，它是更简单、更可靠的选择。这段代码如下所示：
+
+```
+import torch
+import torch._dynamo as dynamo
+def model_where(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    # Compute x as before
+    x = a / (torch.abs(a) + 1)
+    # Preserve compile-time guard to avoid side-effects during tracing
+    if not torch._dynamo.is_compiling():
+        print("do not print during tracing/compiling")
+    # Data-dependent branch expressed using torch.where
+    b = torch.where(
+        b.sum() < 0,  # predicate: a 0-dim bool tensor
+        -b,           # true branch: flip sign
+        b             # false branch: unchanged
+    )
+    return x * b
+# Display the Dynamo explanation just as before
+explanation = dynamo.explain(model_where)(torch.randn(10), torch.randn(10))
+print(explanation)
+```
+
+```
+import torch
+import torch._dynamo as dynamo
+def model_where(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    # Compute x as before
+    x = a / (torch.abs(a) + 1)
+    # Preserve compile-time guard to avoid side-effects during tracing
+    if not torch._dynamo.is_compiling():
+        print("do not print during tracing/compiling")
+    # Data-dependent branch expressed using torch.where
+    b = torch.where(
+        b.sum() < 0,  # predicate: a 0-dim bool tensor
+        -b,           # true branch: flip sign
+        b             # false branch: unchanged
+    )
+    return x * b
+# Display the Dynamo explanation just as before
+explanation = dynamo.explain(model_where)(torch.randn(10), torch.randn(10))
+print(explanation)
+```
+
+Here, torch.where(condition, input, other) returns a tensor selecting elements from input where condition is True and from other where condition is False. Because b.sum() < 0 produces a 0-dimensional Boolean tensor, it can be broadcast across all elements of b. This allows a single, vectorized sign flip instead of an elementwise Python if.
+
+这里，torch.where(condition, input, other) 返回一个张量，在 condition 为 True 处从 input 选取元素、在 condition 为 False 处从 other 选取元素。由于 b.sum() < 0 产生一个 0 维布尔张量，它可以被广播到 b 的所有元素上。这样就用一次向量化的符号翻转，替代了逐元素的 Python if。
+
+> Using torch.where() can avoid graph breaks in compiled and traced pipelines. This allows TorchDynamo to optimize operations inline.
+
+> 使用 torch.where() 可以在已编译和已追踪的流水线中避免图中断。这让 TorchDynamo 能够内联优化这些操作。
+
+It’s also helpful to use torch.compiler.set_stance("fail_on_recompile") to force an error and refuse to run if the code is not cleanly capturable into a full graph. This is useful during development since it lets you catch graph breaks upfront at compile time instead of silently falling back to slower PyTorch eager execution.
+
+使用 torch.compiler.set_stance("fail_on_recompile") 也很有帮助，它会在代码无法被干净地捕获为完整图时强制报错并拒绝运行。这在开发期间很有用，因为它让你能在编译期提前捕捉到图中断，而不是悄悄回退到较慢的 PyTorch 即时执行。
+
+> torch.compiler.set_stance("fail_on_recompile") is also useful to add in your CI build to catch any graph breaks introduced later in the development process. Having robust and continuous performance-regression tests is extremely important throughout the life of a project.
+
+> torch.compiler.set_stance("fail_on_recompile") 也适合加入你的 CI 构建，以捕捉开发过程后期引入的任何图中断。在项目的整个生命周期中，拥有健壮且持续的性能回归测试极其重要。
+
+### Minimize Graph Recompilations
+
+### 最小化图的重新编译
+
+Besides graph breaks, you should also monitor the number of recompilations. TorchDynamo might be compiling the graph many times if its guards keep invalidating input tensor shapes, etc. If a tensor’s shape changes at runtime, the guard fails and triggers a recompile. If you see more recompiles than expected, investigate which guard (shape, dtype, etc.) is causing it—and address the issue.
+
+除了图中断之外，你还应监控重新编译的次数。如果 TorchDynamo 的保护条件不断使输入张量形状等失效，它可能会多次编译同一个图。如果某个张量的形状在运行时发生变化，保护条件就会失效并触发一次重新编译。如果你看到的重新编译多于预期，就要排查是哪个保护条件（形状、dtype 等）导致的——并解决该问题。
+
+Typically, you’ll notice recompilations happening because iterations will continue to be slow—even after the initial warm-up/compile iterations. Fortunately, you can have PyTorch log each guard evaluation and any trigger recompilation using TORCH_LOGS="graph_breaks,recompiles,guards".
+
+通常，你会注意到重新编译正在发生，因为迭代会持续很慢——即便在最初的预热/编译迭代之后也是如此。幸运的是，你可以让 PyTorch 用 TORCH_LOGS="graph_breaks,recompiles,guards" 记录每次保护条件求值以及任何触发的重新编译。
+
+If you observe frequent guard failures, it often means a Python-side constant, such as a random number seed, timestamp, or loop-varying value, is changing on every iteration—and continuously invalidating the guard and triggering a recompile. In this case, you’ll need to ensure those values are either made static or handled with the dynamic-shape APIs presented earlier (e.g., torch._dynamo.mark_dynamic). This will help avoid needless and excessive recompiles.
+
+如果你观察到频繁的保护条件失效，这往往意味着某个 Python 侧的常量——如随机数种子、时间戳或随循环变化的值——在每次迭代都在变化，从而不断使保护条件失效并触发重新编译。在这种情况下，你需要确保这些值要么被设为静态，要么用前面介绍的动态形状 API（例如 torch._dynamo.mark_dynamic）来处理。这将有助于避免不必要且过度的重新编译。
+
+There are a few common mechanisms to minimize graph recompilations depending on the situation. First, for the constant scenario just mentioned, you can pass the constant into the code block as a tensor to prevent the compiler from guarding on the value and repeatedly failing.
+
+根据不同情况，有几种常见机制可用于最小化图的重新编译。首先，对于刚才提到的常量场景，你可以把该常量作为张量传入代码块，以防止编译器对其取值设置保护而反复失效。
+
+Next, as mentioned earlier, you can mark dynamic dimensions that you know will change using torch._dynamo.mark_dynamic(tensor, dim) to preempt a recompile. Another option is to use torch.compiler.set_stance("eager_on_recompile") to avoid repeated recompiles by falling back to eager mode after *N* number of recompiles. This effectively caps the limit of recompilations.
+
+其次，如前所述，你可以用 torch._dynamo.mark_dynamic(tensor, dim) 标记你已知会变化的动态维度，以先发制人地避免重新编译。另一个选项是使用 torch.compiler.set_stance("eager_on_recompile")，在 *N* 次重新编译之后回退到即时执行模式，从而避免反复重新编译。这实际上为重新编译次数设置了上限。
+
+Another option is to explicitly mark that part of the graph as safe using torch._dynamo.allow_in_graph. Let’s dive into this technique a bit more in the next section.
+
+另一个选项是使用 torch._dynamo.allow_in_graph，显式地把那部分图标记为安全。我们将在下一节更深入地探讨这一技巧。
+
+### Mark Functions and Code Blocks as Safe with allow_in_graph
+
+### 用 allow_in_graph 把函数和代码块标记为安全
+
+When TorchDynamo doesn’t know how to handle a function or code block because it’s using unsupported operations, for example, you can decorate the function or wrap the code with torch._dynamo.allow_in_graph—as either a Python decorator or context manager—to tell Dynamo that it has no side effects. When you do this, Dynamo will then include the code in the trace using a more lenient analysis and acceptance policy. allow_in_graph bypasses some Dynamo safety checks. As such, prefer fixing the root cause of graph breaks first.
+
+当 TorchDynamo 因某个函数或代码块使用了不受支持的操作（例如）而不知如何处理它时，你可以用 torch._dynamo.allow_in_graph——作为 Python 装饰器或上下文管理器——来修饰该函数或包裹该代码，告诉 Dynamo 它没有副作用。这样做之后，Dynamo 会以更宽松的分析与接受策略把该代码纳入追踪。allow_in_graph 会绕过 Dynamo 的一些安全检查。因此，请优先修复图中断的根本原因。
+
+This is an advanced feature and should be used carefully. You are essentially promising that the function is pure, always returns the same output tensor for the same input tensor, depends only on its tensor inputs, and has no side effects. If used incorrectly, you may silently get the wrong results. However, when used correctly, it can be a performance lifesaver if a specific function or code block is causing a graph break even though it’s safe to be traced.
+
+这是一项高级特性，应谨慎使用。你实际上是在承诺该函数是纯函数、对相同的输入张量总是返回相同的输出张量、仅依赖其张量输入、且没有副作用。如果使用不当，你可能会悄无声息地得到错误结果。然而，当使用得当时，如果某个特定函数或代码块本可安全追踪却导致了图中断，它可以成为拯救性能的关键。
+
+In general, you should use allow_in_graph sparingly. It’s a tool for power users to override Dynamo’s conservative nature—but only when you’re absolutely sure that the function does not have side effects or hidden state that could impact the code’s correctness.
+
+一般来说，你应当谨慎地使用 allow_in_graph。它是供高级用户覆盖 Dynamo 保守本性的工具——但只有在你完全确定该函数没有可能影响代码正确性的副作用或隐藏状态时才应使用。
+
+### Tips for Handling Graph Breaks
+
+### 处理图中断的技巧
+
+Graph breaks limit the compiler’s ability to perform large optimizations such as fusing many kernels into a smaller number of efficient kernels. This forces PyTorch to fall back to slower eager execution for certain parts of the graph.
+
+图中断限制了编译器执行大型优化的能力，例如把许多核函数融合成数量更少、更高效的核函数。这会迫使 PyTorch 对图的某些部分回退到较慢的即时执行。
+
+It’s critical to understand what triggers graph breaks—and how to prevent them. Here are some common causes of graph breaks and tips on how to minimize them:
+
+理解什么会触发图中断——以及如何防止它们——至关重要。以下是图中断的一些常见成因，以及如何最小化它们的技巧：
+
+*Avoid in-place operations and unexpected mutations* TorchDynamo can handle some mutations using a mechanism called *functionalization*, which converts in-place operations to out-of-place for tracing. But certain in-place operations might still cause a graph break. If you see a break reason about mutation, such as “mutation on data” or “modifying a global,” try to rewrite that part to avoid in-place operations. Often, you can simply rewrite in-place x.relu_() to out-of-place x = x.relu() to avoid a graph break if being in-place was causing the issue.
+
+*避免原地操作和意外的修改* TorchDynamo 可以借助一种名为 *functionalization（函数化）* 的机制处理某些修改，它会为追踪把原地操作转换为非原地操作。但某些原地操作仍可能导致图中断。如果你看到关于修改的中断原因，如“mutation on data”或“modifying a global”，请尝试重写该部分以避免原地操作。通常，如果“原地”正是问题所在，你只需把原地的 x.relu_() 重写为非原地的 x = x.relu() 即可避免图中断。
+
+*Prefer PyTorch data structures, collections, and tensor operations over equivalent* *Python implementations* Appending to a Python list of tensors inside a function will confuse TorchDynamo since it doesn’t trace growing lists very well. Try to preallocate tensors or use tensor operations like torch.stack() instead of building Python (non-PyTorch) lists dynamically. Calls to many Python libraries, including I/O operations, print, logging, and math.* functions will most likely cause a graph break. It’s recommended to remove these from the performance-critical code paths.
+
+*优先使用 PyTorch 的数据结构、集合类型和张量操作，而非等价的 Python 实现* 在函数内部向一个 Python 张量列表追加元素会让 TorchDynamo 困惑，因为它不太能很好地追踪不断增长的列表。请尝试预分配张量，或使用像 torch.stack() 这样的张量操作，而不是动态构建 Python（非 PyTorch）列表。调用许多 Python 库——包括 I/O 操作、print、logging 以及 math.* 函数——极有可能导致图中断。建议把这些从性能关键的代码路径中移除。
+
+> It’s always recommended to use the PyTorch equivalent of Python data structures, collections, and tensor operations whenever possible. These are heavily optimized for PyTorch compilation, GPU processing, and distributed data transfers, which are common in PyTorch-based AI applications and models.
+
+> 始终建议尽可能使用 Python 数据结构、集合类型和张量操作的 PyTorch 等价物。它们针对 PyTorch 编译、GPU 处理以及分布式数据传输做了大量优化，而这些在基于 PyTorch 的 AI 应用与模型中十分常见。
+
+*Avoid data-dependent control flow, if possible* If you have if tensor.sum() > 0: style logic, TorchDynamo cannot easily trace through this because the condition is unknown at compile time. It would need to choose one branch or the other based on the first run, guard on that condition, and enforce this guard for subsequent invocations. Since this is incorrect, Dynamo will create a graph break.
+
+*尽可能避免数据相关的控制流* 如果你有 if tensor.sum() > 0: 这类逻辑，TorchDynamo 无法轻易追踪它，因为该条件在编译期是未知的。它需要根据首次运行选择其中一个分支、对该条件设置保护、并对后续调用强制执行这个保护。由于这样做是不正确的，Dynamo 会创建一次图中断。
+
+PyTorch supports a high-level operation called torch.cond() to capture certain dynamic flows in graphs. This can encapsulate if/else statements such that both branches are compiled. However, it requires the condition to be a tensor and typically works best for things like parameter-dependent switches rather than arbitrary Python logic.
+
+PyTorch 支持一个名为 torch.cond() 的高层操作，用于在图中捕获某些动态流。它可以封装 if/else 语句，使两个分支都被编译。不过，它要求条件是一个张量，并且通常最适合诸如依赖参数的开关这类情形，而非任意的 Python 逻辑。
+
+Apart from this, most data-dependent control flow still breaks graphs. Continue to prefer tensor operations (torch.where(), masks, etc.) when possible. If neither torch.cond() nor refactoring is feasible, you may have to accept the graph break and its performance impact.
+
+除此之外，大多数数据相关的控制流仍会中断图。请继续在可能时优先使用张量操作（torch.where()、掩码等）。如果 torch.cond() 与重构都不可行，你可能只能接受图中断及其带来的性能影响。
+
+*Understand performance characteristics of overlapping and synchronizing subgraphs* *with PyTorch DDP* PyTorch’s DDP works with TorchDynamo by explicitly breaking graphs at synchronization points, including the all-reduce buckets. You might see breaks in the explain output related to allreduce or torch.distributed ops. This is expected, as PyTorch may compile each gradient bucket’s reduction separately so that it can remove overlap communication with backward computation.
+
+*理解在 PyTorch DDP 下重叠与同步子图的性能特征* PyTorch 的 DDP 通过在同步点（包括 all-reduce 桶）显式中断图来与 TorchDynamo 协同工作。你可能会在 explain 输出中看到与 allreduce 或 torch.distributed 操作相关的中断。这是预期之内的，因为 PyTorch 可能会单独编译每个梯度桶的归约，以便让它能把通信与反向计算相重叠。
+
+You can’t avoid graph breaks at DDP communication boundaries if you want to preserve compute-communication overlap. PyTorch’s compiler and DDP intentionally insert breaks at each all-reduce bucket so that gradient synchronization happens between subgraphs. This lets one bucket’s communication overlap with the backward computation of the next bucket.
+
+如果你想保持计算-通信重叠，就无法在 DDP 通信边界处避免图中断。PyTorch 的编译器与 DDP 会有意在每个 all-reduce 桶处插入中断，从而让梯度同步发生在各子图之间。这让一个桶的通信可以与下一个桶的反向计算相重叠。
+
+While this does prevent a single monolithic graph, it preserves performance. TorchDynamo + DDP runs with similar performance to eager-mode DDP. And it can even outperform eager DDP at scale. So, although you can’t eliminate these communication graph breaks, they are necessary to achieve correct and efficient distributed training with the proper overlap.
+
+虽然这确实会阻止形成单一的整体图，但它保持了性能。TorchDynamo + DDP 的运行性能与即时执行模式的 DDP 相近。在大规模下，它甚至能优于即时执行的 DDP。所以，尽管你无法消除这些通信图中断，它们对于实现正确且高效、并带有恰当重叠的分布式训练是必要的。
+
+*Wrap graph submodules with PyTorch FSDP* PyTorch supports FSDP in compiled mode by using use_original_params=True. A best practice is to wrap submodules, like each transformer block, into their own FSDP submodule. Dynamo will then create explicit graph breaks at each FSDP submodule boundary. This allows each shard’s communication to overlap with computation, similar to the bucketization strategy described for DDP.
+
+*用 PyTorch FSDP 包裹图子模块* PyTorch 通过使用 use_original_params=True 支持在已编译模式下运行 FSDP。一条最佳实践是把子模块（如每个 transformer 块）各自包裹进它们自己的 FSDP 子模块。Dynamo 随后会在每个 FSDP 子模块边界处创建显式的图中断。这让每个分片的通信可以与计算相重叠，类似于前面为 DDP 描述的分桶策略。
+
+Compiled FSDP fuses forward and backward passes and reuses buffers across model shards using AOT Autograd and Inductor’s memory planner. As such, only the active parameter slices and minimal intermediate memory buffers are resident on each GPU. This reduces peak memory usage compared to DDP or eager mode.
+
+编译后的 FSDP 会借助 AOT Autograd 和 Inductor 的内存规划器融合前向与反向传播，并在各模型分片之间复用缓冲区。因此，每块 GPU 上只驻留处于活跃状态的参数切片以及最少量的中间内存缓冲区。与 DDP 或即时执行模式相比，这降低了峰值内存占用。
+
+The memory savings comes from avoiding redundant gradient storage, reusing intermediate allocations, and overlapping communication with computation across shards. And these allow larger models to fit into each GPU. If you don’t wrap submodules individually, FSDP falls back to treating all parameters as one big bucket. This still works, but it limits memory benefits and overlap potential. As such, combining torch.compile with per-module FSDP wrappers is recommended for maximum speed and memory efficiency—especially on large-scale training jobs.
+
+内存节省来自：避免冗余的梯度存储、复用中间分配，以及在各分片间将通信与计算重叠。这些手段使得更大的模型能够放入每块 GPU。如果你不逐一包装子模块，FSDP 会退回到把所有参数当作一个大桶来处理。这仍然可以工作，但会限制内存收益与重叠潜力。因此，建议将 torch.compile 与按模块的 FSDP 包装器结合使用，以获得最高的速度和内存效率——在大规模训练作业中尤其如此。
+
+> Debugging can be very complex if issues arise—and even more complex in a larger cluster/configuration. Always test on a smaller configuration when using FSDP with torch.compile.
+
+> 一旦出现问题，调试可能非常复杂——在更大的集群/配置中会更加复杂。在将 FSDP 与 torch.compile 搭配使用时，务必先在较小的配置上测试。
+
+*Monitor performance tradeoffs when using custom and third-party CUDA C++ and* *Triton operations* If you rely on a custom or third-party CUDA extension that PyTorch doesn’t know about, Dynamo will create a graph break because it can’t reason about what that operation does—or whether it’s safe. If it’s performance-critical, consider rewriting the custom operation in Python using Triton.
+
+*在使用自定义及第三方 CUDA C++ 和 Triton 算子时监控性能权衡* 如果你依赖某个 PyTorch 并不了解的自定义或第三方 CUDA 扩展，Dynamo 会产生一次图中断，因为它无法推断该算子的行为——也无法判断它是否安全。如果该算子对性能至关重要，可以考虑用 Triton 以 Python 重写这个自定义算子。
+
+PyTorch supports torch.library.triton_op() API that lets you integrate Triton kernels as custom operations into PyTorch seamlessly. This lets the compiler peek inside the Triton code to perform optimizations. Before diving into Triton, let’s quickly summarize how to debug various compiler phases, graph breaks, and compiler performance.
+
+PyTorch 支持 torch.library.triton_op() API，它让你能够把 Triton 核函数（kernel）作为自定义算子无缝集成到 PyTorch 中。这使编译器得以窥探 Triton 代码内部并执行优化。在深入 Triton 之前，我们先快速总结一下如何调试各个编译器阶段、图中断以及编译器性能。
+
+> Many popular third-party libraries now provide either a Triton implementation or Dynamo/FX wrappers for their operations. Check if these exist before writing your own.
+
+> 如今许多流行的第三方库要么提供了 Triton 实现，要么为其算子提供了 Dynamo/FX 包装器。在自己动手写之前，先查一查这些是否已经存在。
+
+## Debugging Compiler Phases, Graph Breaks, and Performance
+
+## 调试编译器阶段、图中断与性能
+
+You can log and debug different types of compiler events at runtime by setting various environment variables such as TORCH_LOGS, TORCH_COMPILE_DEBUG, and TORCHDYNAMO_REPRO_*. These include graph breaks, recompiles, guards, and other compiler decisions. An example of setting TORCH_LOGS is shown next (see Table 14-1 for common values):
+
+你可以在运行时通过设置各种环境变量（如 TORCH_LOGS、TORCH_COMPILE_DEBUG 和 TORCHDYNAMO_REPRO_*）来记录并调试不同类型的编译器事件。这些事件包括图中断、重新编译、保护条件以及其他编译器决策。设置 TORCH_LOGS 的一个示例如下所示（常用取值见表 14-1）：
+
+```
+# "graph_breaks", "dynamo", "aot_graphs", "inductor",
+# "graph_outputs", "graph_code", "dynamic", "perf_hints",
+# "output_code", "recompiles", "guards", etc.
+TORCH_LOGS="graph_breaks" python train.py
+```
+
+```
+# "graph_breaks", "dynamo", "aot_graphs", "inductor",
+# "graph_outputs", "graph_code", "dynamic", "perf_hints",
+# "output_code", "recompiles", "guards", etc.
+TORCH_LOGS="graph_breaks" python train.py
+```
+
+This will cause PyTorch to print out whenever a graph break occurs. To summarize the different logging options, you can set TORCH_LOGS to the following to debug torch.compile, including the different phases (TorchDynamo, AOT Autograd, and TorchInductor), graphs, graph breaks, generated code, performance, recompiles, and guards—as well as compiler decisions and performance, as shown in Table 14-1.
+
+这会让 PyTorch 在每次发生图中断时打印相关信息。为了总结各种日志选项，你可以将 TORCH_LOGS 设置为下列取值来调试 torch.compile，涵盖各个阶段（TorchDynamo、AOT Autograd 和 TorchInductor）、图、图中断、生成的代码、性能、重新编译与保护条件——以及编译器决策和性能，如表 14-1 所示。
+
+Table 14-1. Logging options for torch.compile
+
+表 14-1. torch.compile 的日志选项
+
+| TORCH_LOGS value | Description |
+| --- | --- |
+| graph_breaks | Logs graph break events |
+| dynamo | Verbose logging from TorchDynamo |
+| aot_graphs | Verbose logging from AOT Autograd |
+| inductor | Verbose logging from TorchInductor |
+| graph_outputs | Shows the compiled FX graphs |
+| graph_code | Dumps the Python code for each FX graph that TorchDynamo produces |
+| dynamic | Traces decisions around dynamic shapes and when dimensions are marked as dynamic |
+| perf_hints | Shows you the missed performance-optimization opportunities |
+| output_code | Prints the generated code for each compiled graph |
+| recompiles | Logs recompilation triggers |
+| guards | Logs guards and guard evaluations |
+
+| TORCH_LOGS 取值 | 说明 |
+| --- | --- |
+| graph_breaks | 记录图中断事件 |
+| dynamo | 来自 TorchDynamo 的详细日志 |
+| aot_graphs | 来自 AOT Autograd 的详细日志 |
+| inductor | 来自 TorchInductor 的详细日志 |
+| graph_outputs | 显示编译后的 FX 图 |
+| graph_code | 转储 TorchDynamo 生成的每个 FX 图的 Python 代码 |
+| dynamic | 追踪关于动态形状的决策，以及维度何时被标记为动态 |
+| perf_hints | 显示错失的性能优化机会 |
+| output_code | 打印每个编译图生成的代码 |
+| recompiles | 记录触发重新编译的原因 |
+| guards | 记录保护条件及保护条件的求值 |
+
+These settings can be useful if you suspect an issue in how the subgraphs were segmented—and which shapes were compiled. With these settings, you will get a lot of internal debugging information without changing your code.
+
+如果你怀疑子图的切分方式——以及编译了哪些形状——存在问题，这些设置会很有用。有了这些设置，你无需改动代码就能获得大量内部调试信息。
+
+> Be prepared for very verbose output. It’s recommended to start with just "graph_breaks" when debugging just graph breaks, for example.
+
+> 请做好输出非常冗长的准备。例如，当你只想调试图中断时，建议从仅设置 "graph_breaks" 开始。
+
+Under the hood, setting TORCH_LOGS is analogous to using the torch._logging.set_logs() API. However, setting TORCH_LOGS is sometimes easier to configure externally as an environment variable.
+
+在底层，设置 TORCH_LOGS 相当于使用 torch._logging.set_logs() API。不过，将 TORCH_LOGS 作为环境变量在外部配置有时更为简便。
+
+And remember that you can also set TORCH_COMPILE_DEBUG=1 to enable TorchInductor’s debug mode. This will log the FX Graph, the TorchInductor IR, the generated Triton code, and an HTML report with visualizations if Graphviz is installed.
+
+另外请记住，你还可以设置 TORCH_COMPILE_DEBUG=1 来启用 TorchInductor 的调试模式。这会记录 FX 图、TorchInductor IR、生成的 Triton 代码，以及一份带可视化的 HTML 报告（前提是已安装 Graphviz）。
+
+You can also set TORCHDYNAMO_REPRO_AFTER and TORCHDYNAMO_REPRO_LEVEL to force TorchDynamo to dump its graph after each stage. It will also perform a runtime comparison against a noncompiled, eager-mode version of the code.
+
+你也可以设置 TORCHDYNAMO_REPRO_AFTER 和 TORCHDYNAMO_REPRO_LEVEL，强制 TorchDynamo 在每个阶段之后转储其图。它还会针对未编译的即时执行版本代码进行运行时对比。
+
+It’s also possible to trace through compilations logs using a tool called tlparse. Trace logs are useful for debugging compilation events (e.g., recompilations) as well as generating bug reports.
+
+此外，还可以使用一个名为 tlparse 的工具来遍历编译日志。追踪日志对于调试编译事件（例如重新编译）以及生成缺陷报告都很有用。
+
+To enable trace logs, specify the *trace-log* directory using the TORCH_TRACE environment variable. Then run tlparse on the *trace-log* directory to produce a tree representation of stack frames as shown here:
+
+要启用追踪日志，请通过 TORCH_TRACE 环境变量指定 *trace-log* 目录。然后在该 *trace-log* 目录上运行 tlparse，即可生成如下所示的栈帧树状表示：
+
+```
+- /workspace/networks/layers/transformer.py:634 in forward
+  .../torch/nn/modules/module.py in _wrapped_call_impl
+ .../torch/nn/modules/module.py in _call_impl
+  - [2/2] [2/3] ../torch/_dynamo/convert_frame.py in __call__
+  - /workspace/networks/layers/transformer.py:753 in forward
+    - [8/2] [8/3] .../torch/_dynamo/convert_frame.py in __call__
+...
+```
+
+```
+- /workspace/networks/layers/transformer.py:634 in forward
+  .../torch/nn/modules/module.py in _wrapped_call_impl
+ .../torch/nn/modules/module.py in _call_impl
+  - [2/2] [2/3] ../torch/_dynamo/convert_frame.py in __call__
+  - /workspace/networks/layers/transformer.py:753 in forward
+    - [8/2] [8/3] .../torch/_dynamo/convert_frame.py in __call__
+...
+```
+
+In addition, you can use the Perfetto UI to display a trace timeline visualization. And since tracing incurs minimal overhead, it’s even possible to enable TORCH_TRACE in production.
+
+此外，你可以使用 Perfetto UI 来展示追踪时间线的可视化。而且由于追踪带来的开销极小，甚至可以在生产环境中启用 TORCH_TRACE。
+
+Let’s now dive deeper into OpenAI’s Triton language and compiler used by TorchInductor. We’ll write some basic and advanced Triton kernels and then register them with PyTorch.
+
+现在，让我们更深入地探讨 TorchInductor 所使用的 OpenAI Triton 语言与编译器。我们将编写一些基础与进阶的 Triton 核函数，然后把它们注册到 PyTorch。
+
+## Writing Custom Kernels with OpenAI Triton
+
+## 用 OpenAI Triton 编写自定义核函数
+
+Up until now, we’ve only briefly mentioned OpenAI’s open source Triton language and compiler. Now it’s time to dive deeper since TorchInductor uses Triton as its backend code-generation implementation—and because Triton is growing in popularity with backing from large companies like OpenAI.
+
+到目前为止，我们只是简单提及了 OpenAI 开源的 Triton 语言与编译器。现在是深入探讨的时候了，因为 TorchInductor 使用 Triton 作为其后端代码生成的实现——也因为在 OpenAI 这类大公司的支持下，Triton 正日益流行。
+
+As mentioned, Inductor uses Triton to generate optimized GPU kernels under the hood. By examining, understanding, and customizing these kernels, you can further improve performance beyond what TorchInductor could produce. Learning Triton is critical to performance optimizations in a PyTorch and NVIDIA GPU environment.
+
+如前所述，Inductor 在底层使用 Triton 来生成经过优化的 GPU 核函数。通过检视、理解并定制这些核函数，你可以把性能进一步推高到超出 TorchInductor 所能产出的水平。在 PyTorch 与 NVIDIA GPU 环境中，学习 Triton 对性能优化至关重要。
+
+At a high level, OpenAI Triton is an open source, Python-native domain-specific language (DSL) for writing GPU kernels in familiar Python. Triton also includes a JIT compiler that converts Triton code into NVIDIA PTX code directly. In other words, Triton lets you create high-performance custom GPU operations in Python—without writing CUDA C++ by hand. Triton remains tightly integrated with PyTorch, making it the go-to choice for custom GPU kernels in this ecosystem.
+
+从高层看，OpenAI Triton 是一种开源、Python 原生的领域特定语言，用于以熟悉的 Python 编写 GPU 核函数。Triton 还包含一个 JIT 编译器，可将 Triton 代码直接转换为 NVIDIA PTX 代码。换言之，Triton 让你能够用 Python 创建高性能的自定义 GPU 算子——而无需手写 CUDA C++。Triton 与 PyTorch 保持紧密集成，使其成为该生态系统中编写自定义 GPU 核函数的首选。
+
+Writing a GPU kernel in Triton is much more familiar and simpler than CUDA C++. This is especially true for researchers who prefer to stay in Python, iterate quickly, and not worry about complex C++ templates or detailed memory management. They simply don’t need to use C++ in an era when GPU-performance-focused compilers like PyTorch and Triton exist.
+
+用 Triton 编写 GPU 核函数比用 CUDA C++ 更为熟悉、也更简单。对那些倾向于留在 Python 中、快速迭代、不愿操心复杂 C++ 模板或细致内存管理的研究者而言，尤其如此。在 PyTorch 和 Triton 这类专注 GPU 性能的编译器已经存在的时代，他们根本无需再使用 C++。
+
+> NVIDIA has recognized this trend. In 2025, they announced Python-centric CUDA libraries (e.g., cuTile, CuTe Python DSL, CUTLASS Python DSL, and cuPyNumeric numpy replacement). These are essentially competing libraries to Triton. Integration with torch.compile continues to evolve, and as of this writing, TorchInductor still uses Triton as its primary GPU code generation path.
+
+> NVIDIA 已经注意到了这一趋势。2025 年，他们发布了以 Python 为中心的 CUDA 库（例如 cuTile、CuTe Python DSL、CUTLASS Python DSL 以及作为 numpy 替代品的 cuPyNumeric）。这些本质上是与 Triton 竞争的库。与 torch.compile 的集成仍在持续演进，而在本文写作之时，TorchInductor 仍以 Triton 作为其主要的 GPU 代码生成路径。
+
+While PyTorch’s torch.compile automates a lot of kernel generation, custom Triton kernels can squeeze out the last drops of performance—especially for operations outside of TorchInductor’s current scope like complex sparse patterns and novel layer types. It’s sometimes possible to beat the performance of TorchInductor’s generated code—especially if you have domain-specific knowledge. However, this is very advanced and will require ongoing maintenance and potential rewrites for new hardware support.
+
+虽然 PyTorch 的 torch.compile 自动化了大量的核函数生成工作，但自定义 Triton 核函数仍能榨出最后一点性能——尤其是对于超出 TorchInductor 当前覆盖范围的算子，如复杂的稀疏模式和新型层类型。有时确实可以击败 TorchInductor 生成代码的性能——如果你具备领域特定的知识，就更是如此。然而，这非常高阶，并且需要持续维护，还可能因支持新硬件而需要重写。
+
+Let’s now start with a quick Triton programming primer. Then we’ll dive into some interesting Triton topics, including accessing shared-memory, registering a Triton kernel with PyTorch, autotuning kernel-launch parameters, and profiling. Then we’ll progress to cover advanced Triton topics such as warp specialization and software pipelining (e.g., double buffering).
+
+现在，让我们从一段简短的 Triton 编程入门开始。随后我们会深入一些有趣的 Triton 主题，包括访问共享内存（shared memory）、向 PyTorch 注册 Triton 核函数、自动调优核函数启动参数以及剖析。接着我们会进一步覆盖诸如 warp 专门化和软件流水线（software pipelining，例如双缓冲）等进阶的 Triton 主题。
+
+### Triton Programming Model
+
+### Triton 编程模型
+
+Triton uses a single-program, multiple-data (SPMD) model, as opposed to CUDA’s SIMT model. This is significant because Triton intentionally abstracts away the low-level details of CUDA instructions and threads.
+
+Triton 采用单程序多数据（single-program, multiple-data，SPMD）模型，而非 CUDA 的 SIMT 模型。这一点很重要，因为 Triton 有意抽象掉了 CUDA 指令和线程的底层细节。
+
+Triton kernels (aka *programs*) operate at a higher level by running instances of the program on separate thread blocks (aka *cooperative thread arrays*, or CTAs) as the fundamental unit of compute. This is in contrast to CUDA kernels, which run on individual threads in a thread block.
+
+Triton 核函数（又称 *程序*）在更高的层面运作：它把程序的多个实例运行在各自独立的线程块（thread block，又称 *协作线程数组*，即 cooperative thread arrays，CTA）上，并以此作为基本的计算单元。这与 CUDA 核函数形成对比——后者运行在线程块内的单个线程上。
+
+> The community tends to use Triton *kernel* and Triton *program* interchangeably—typically preferring Triton *kernel*, so this book uses Triton *kernel* for the most part.
+
+> 社区往往把 Triton *kernel* 和 Triton *program* 混用——通常更偏爱 Triton *kernel*，因此本书大多数情况下使用 Triton *kernel*（核函数）。
+
+You write a Triton kernel with the Triton Python DSL. Then the Triton JIT compiler compiles the kernel into GPU code that runs many parallel instances of this kernel. Each program instance maps to a CUDA thread block.
+
+你用 Triton 的 Python DSL 编写 Triton 核函数。然后 Triton JIT 编译器把该核函数编译成 GPU 代码，从而运行该核函数的众多并行实例。每个程序实例都映射到一个 CUDA 线程块。
+
+Triton kernels (aka *programs*) are defined by decorating a Python function with @triton.jit. Within the kernel, you use special primitives from the triton.language module, commonly aliased as tl, to work with memory pointers, perform vectorized loads/stores, and compute per-program indices using tl.program_id and block offset arithmetic.
+
+Triton 核函数（又称 *程序*）通过用 @triton.jit 装饰一个 Python 函数来定义。在核函数内部，你使用来自 triton.language 模块（通常别名为 tl）的特殊原语来操作内存指针、执行向量化的加载/存储，并使用 tl.program_id 和块偏移算术来计算每个程序各自的索引。
+
+Triton’s SPMD model means you typically work with vectorized operations such as adding two tl.arange vectors. The Triton compiler maps vectorized SPMD code across the threads in a CUDA block. There is no guaranteed one-element-to-one-thread mapping.
+
+Triton 的 SPMD 模型意味着你通常处理的是向量化操作，例如把两个 tl.arange 向量相加。Triton 编译器会把向量化的 SPMD 代码映射到 CUDA 块中的各个线程上。它并不保证元素与线程之间是一一对应的映射。
+
+You don’t explicitly need to manage individual threads or warps with Triton since its compiler does this for you. Here is a simple Triton kernel that adds two vectors of equal size, n_elements, in this case:
+
+使用 Triton 时，你无需显式管理单个线程或 warp，因为它的编译器会替你完成这些工作。下面是一个简单的 Triton 核函数，它把两个大小相等（本例中为 n_elements）的向量相加：
+
+```
+import triton
+import triton.language as tl
+BLOCK_SIZE = 1024
+@triton.jit
+def vector_add_kernel(x_ptr,y_ptr,out_ptr,n_elements,BLOCK_SIZE: tl.constexpr):
+    pid = tl.program_id(axis=0)              # unique program ID for each block
+    block_start = pid * BLOCK_SIZE
+    # each program handles BLOCK_SIZE elements
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    # Create a mask to guard against out-of-bounds
+    # (if n is not divisible by BLOCK_SIZE)
+    mask = offsets < n_elements
+    x = tl.load(x_ptr + offsets, mask=mask)        # masked load
+    y = tl.load(y_ptr + offsets, mask=mask)
+    result = x + y
+    tl.store(out_ptr + offsets, result, mask=mask) # masked store
+```
+
+```
+import triton
+import triton.language as tl
+BLOCK_SIZE = 1024
+@triton.jit
+def vector_add_kernel(x_ptr,y_ptr,out_ptr,n_elements,BLOCK_SIZE: tl.constexpr):
+    pid = tl.program_id(axis=0)              # unique program ID for each block
+    block_start = pid * BLOCK_SIZE
+    # each program handles BLOCK_SIZE elements
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    # Create a mask to guard against out-of-bounds
+    # (if n is not divisible by BLOCK_SIZE)
+    mask = offsets < n_elements
+    x = tl.load(x_ptr + offsets, mask=mask)        # masked load
+    y = tl.load(y_ptr + offsets, mask=mask)
+    result = x + y
+    tl.store(out_ptr + offsets, result, mask=mask) # masked store
+```
+
+Here, you see that Triton abstracts away threads and warps. Note that BLOCK_SIZE is a compile-time constant that defines how many elements each program instance processes. The number of threads per CUDA block is controlled by the kernel’s configuration using num_warps and is not equal to BLOCK_SIZE.
+
+在这里你可以看到，Triton 抽象掉了线程和 warp。注意，BLOCK_SIZE 是一个编译期常量，用于定义每个程序实例处理多少个元素。每个 CUDA 块的线程数由核函数配置通过 num_warps 控制，并不等于 BLOCK_SIZE。
+
+Specifically, in the preceding code, tl.arange(0, BLOCK_SIZE) returns a vector of indices of size BLOCK_SIZE ([0, 1, ..., BLOCK_SIZE-1]). We add pid * BLOCK_SIZE, or block_start, to the vector of indices in order to derive the actual indices, x_ptr + offsets and y_ptr + offsets, into each vector for this instance of the kernel running on a thread block.
+
+具体来说，在前面的代码中，tl.arange(0, BLOCK_SIZE) 返回一个大小为 BLOCK_SIZE 的索引向量（[0, 1, ..., BLOCK_SIZE-1]）。我们把 pid * BLOCK_SIZE（即 block_start）加到该索引向量上，从而推导出运行在某个线程块上的这个核函数实例进入每个向量的实际索引 x_ptr + offsets 和 y_ptr + offsets。
+
+Assuming we launch enough Triton kernel instances to cover the total number of elements, n_elements, in each of the vectors, this kernel will add together every element of the two vectors, x_ptr and y_ptr, and store the result in out_ptr. In essence, Triton lets you write kernel logic in a tensorized manner.
+
+假设我们启动了足够多的 Triton 核函数实例，以覆盖每个向量中元素的总数 n_elements，那么该核函数就会把两个向量 x_ptr 和 y_ptr 的每一个元素相加，并把结果存入 out_ptr。本质上，Triton 让你能以张量化的方式编写核函数逻辑。
+
+Here, for example, we operate on a whole block of indices (offsets) at once. The Triton compiler takes care of splitting this work among actual GPU threads and makes sure that memory accesses (tl.load and tl.store) are coalesced when possible.
+
+例如在这里，我们一次性对整整一个索引块（offsets）进行操作。Triton 编译器负责把这项工作拆分到实际的 GPU 线程之间，并确保内存访问（tl.load 和 tl.store）在可能时被合并（coalesce）。
+
+To launch instances of this Triton kernel, pass a grid function that computes the number of program instances from meta['BLOCK_SIZE']:
+
+要启动该 Triton 核函数的实例，需传入一个 grid 函数，它根据 meta['BLOCK_SIZE'] 计算程序实例的数量：
+
+```
+import triton
+def grid(meta):
+    return (triton.cdiv(n_elements, meta['BLOCK_SIZE']),)
+vector_add_kernel[grid](x_ptr, y_ptr, out_ptr, n_elements, BLOCK_SIZE=1024)
+```
+
+```
+import triton
+def grid(meta):
+    return (triton.cdiv(n_elements, meta['BLOCK_SIZE']),)
+vector_add_kernel[grid](x_ptr, y_ptr, out_ptr, n_elements, BLOCK_SIZE=1024)
+```
+
+Here, the code uses a mask to avoid out-of-bounds memory access when n_elements isn’t a multiple of BLOCK_SIZE. This is similar to earlier chapters on CUDA in which we used if (idx < N) within our kernel to avoid out-of-bounds index errors.
+
+在这里，代码使用一个掩码（mask）来避免当 n_elements 不是 BLOCK_SIZE 的整数倍时发生越界内存访问。这与前面讲 CUDA 的章节类似——那时我们在核函数中使用 if (idx < N) 来避免越界索引错误。
+
+> The use of a mask in loads/stores is a clever and convenient way to handle boundary conditions without requiring explicit checks or if/else branches.
+
+> 在加载/存储中使用掩码，是一种巧妙而便利的边界条件处理方式，无需显式检查或 if/else 分支。
+
+Under the hood, Triton converts this program to NVIDIA PTX such that each program uses a single CUDA thread block. Each program maps to a CUDA thread block. tl.arange produces per-lane indices within the program, and the compiler maps this vectorized index space across the thread in the block. You can also manage multidimensional indices for matrix operations in a straightforward way. Triton will automatically handle vectorizing your arithmetic and memory operations for you.
+
+在底层，Triton 会把这个程序转换为 NVIDIA PTX，使每个程序使用单个 CUDA 线程块。每个程序都映射到一个 CUDA 线程块。tl.arange 在程序内生成逐通道（per-lane）的索引，编译器再把这个向量化的索引空间映射到块中的各个线程上。你也可以以直观的方式管理矩阵运算所需的多维索引。Triton 会自动为你处理算术与内存操作的向量化。
+
+In short, Triton gives you the productivity of Python with the performance of optimized CUDA C++ kernels. It also lets you drop down into low-level optimizations to manipulate and utilize the full memory hierarchy (e.g., shared-memory tiling, etc.), as we demonstrate in the next section.
+
+简言之，Triton 让你在获得 Python 的开发效率的同时，享有经过优化的 CUDA C++ 核函数的性能。它还允许你下沉到底层优化，以操控并充分利用整个内存层次结构（例如共享内存分块等），下一节我们会演示这一点。
+
+### Accessing Shared Memory in Triton
+
+### 在 Triton 中访问共享内存
+
+Efficient Triton kernels take advantage of the L2 cache and software-managed shared memory on each SM. When using shared memory, each thread block loads a tile from both matrix A and B into shared memory. This is in contrast to each thread repeatedly loading the same values from global memory.
+
+高效的 Triton 核函数会利用 L2 缓存和每个 SM 上由软件管理的共享内存。使用共享内存时，每个线程块会把来自矩阵 A 和 B 的一个分块（tile）加载到共享内存中。这与每个线程反复从全局内存加载相同数值形成对比。
+
+The kernel then reuses those tiles for multiple computations. This better utilizes the on-chip memory caches and reduces the amount of data traveling between global HBM and the registers.
+
+随后，核函数会复用这些分块进行多次计算。这样能更好地利用片上内存缓存，并减少在全局 HBM 与寄存器（register）之间往返的数据量。
+
+Triton does not expose an explicit shared-memory allocator. Instead, it stages tiles in on-chip shared memory using tensor descriptors (tl.make_tensor_descriptor(...)) and an asynchronous pipeline using the intended shapes and strides. This way, you can issue loads and stores through those descriptors inside a pipelined tl.range(..., num_stages=...). This loop lowers to cp.async, TMA, and barriers.
+
+Triton 并不暴露显式的共享内存分配器。相反，它使用张量描述符（tl.make_tensor_descriptor(...)）以及一条按预期形状与步长构建的异步流水线，把分块暂存在片上共享内存中。这样，你就可以在一个流水线化的 tl.range(..., num_stages=...) 内部通过这些描述符发起加载与存储。该循环会下降为 cp.async、TMA 和屏障。
+
+### Registering Custom Kernels with PyTorch
+
+### 向 PyTorch 注册自定义核函数
+
+After writing a Triton kernel, you can register it as a custom operation in PyTorch using torch.library.triton_op. This makes the Triton kernel visible to torch.compile without treating it as an opaque, black-box operation that could fall back to eager execution mode. This way, the compiler knows about the Triton kernel, includes it during graph capture, and optimizes it along with the rest of the graph. This allows additional optimizations such as fusion.
+
+写好一个 Triton 核函数后，你可以使用 torch.library.triton_op 把它注册为 PyTorch 中的自定义算子。这让 Triton 核函数对 torch.compile 可见，而不是被当作一个可能回退到即时执行模式的不透明黑盒算子。这样一来，编译器就了解该 Triton 核函数、会在图捕获期间将其纳入，并把它与图的其余部分一起优化。由此便可实现诸如融合之类的额外优化。
+
+Registering the Triton kernel helps avoid graph breaks when using custom Triton kernels/programs with the PyTorch compiler. Here is an example of registering and calling the Triton kernel vector_add_kernel from PyTorch:
+
+注册 Triton 核函数有助于在把自定义 Triton 核函数/程序与 PyTorch 编译器搭配使用时避免图中断。下面是一个从 PyTorch 中注册并调用 Triton 核函数 vector_add_kernel 的示例：
+
+```
+import torch
+import triton
+import triton.language as tl
+from torch.library import triton_op, wrap_triton
+from torch import Tensor
+# Triton compute kernel
+@triton.jit
+def vector_add_kernel(
+    x_ptr, y_ptr, out_ptr, n_elements,
+    BLOCK_SIZE: tl.constexpr
+):
+    pid = tl.program_id(0)
+    start = pid * BLOCK_SIZE
+    offsets = start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+    x = tl.load(x_ptr + offsets, mask=mask)
+    y = tl.load(y_ptr + offsets, mask=mask)
+    tl.store(out_ptr + offsets, x + y, mask=mask)
+# Register as a Triton-backed PyTorch op
+@triton_op("my_triton_lib::vector_add", mutates_args=())
+def vector_add(x: Tensor, y: Tensor) -> Tensor:
+    assert x.device.type == "cuda" and y.device.type == "cuda"
+    n = x.numel()
+    out = torch.empty_like(x)
+    # Compute grid size
+    def grid_fn(meta):
+        return (triton.cdiv(n, meta["BLOCK_SIZE"]),)
+    # Wrap and launch the Triton kernel
+    wrap_triton(vector_add_kernel)[grid_fn](x, y, out, n, BLOCK_SIZE=1024)
+    return out
+# Usage
+a = torch.randn(10_000, device="cuda")
+b = torch.randn(10_000, device="cuda")
+c = torch.ops.my_triton_lib.vector_add(a, b)
+```
+
+```
+import torch
+import triton
+import triton.language as tl
+from torch.library import triton_op, wrap_triton
+from torch import Tensor
+# Triton compute kernel
+@triton.jit
+def vector_add_kernel(
+    x_ptr, y_ptr, out_ptr, n_elements,
+    BLOCK_SIZE: tl.constexpr
+):
+    pid = tl.program_id(0)
+    start = pid * BLOCK_SIZE
+    offsets = start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+    x = tl.load(x_ptr + offsets, mask=mask)
+    y = tl.load(y_ptr + offsets, mask=mask)
+    tl.store(out_ptr + offsets, x + y, mask=mask)
+# Register as a Triton-backed PyTorch op
+@triton_op("my_triton_lib::vector_add", mutates_args=())
+def vector_add(x: Tensor, y: Tensor) -> Tensor:
+    assert x.device.type == "cuda" and y.device.type == "cuda"
+    n = x.numel()
+    out = torch.empty_like(x)
+    # Compute grid size
+    def grid_fn(meta):
+        return (triton.cdiv(n, meta["BLOCK_SIZE"]),)
+    # Wrap and launch the Triton kernel
+    wrap_triton(vector_add_kernel)[grid_fn](x, y, out, n, BLOCK_SIZE=1024)
+    return out
+# Usage
+a = torch.randn(10_000, device="cuda")
+b = torch.randn(10_000, device="cuda")
+c = torch.ops.my_triton_lib.vector_add(a, b)
+```
+
+Here, triton_op("my_triton_lib::vector_add", mutates_args=()) registers the operator name and mutation metadata (empty) with PyTorch. Then wrap_triton (vector_add_kernel) wraps the raw Triton kernel into a callable that the compiler can inline and optimize within the torch.compile graph. The compiler will then fuse, reorder, and inline this kernel within the rest of the torch.compile graph.
+
+在这里，triton_op("my_triton_lib::vector_add", mutates_args=()) 向 PyTorch 注册了算子名称和（为空的）变异元数据。接着，wrap_triton(vector_add_kernel) 把原始的 Triton 核函数包装成一个可调用对象，使编译器能够在 torch.compile 图内对其进行内联和优化。随后，编译器会在 torch.compile 图的其余部分中对该核函数进行融合、重排和内联。
+
+Registering forward-only operations is straightforward. However, to leverage PyTorch’s automatic differentiation for full training support, you typically need to implement and register a custom backward computation. Otherwise, you need to compose it from existing differentiable primitives.
+
+注册仅前向的算子很直接。然而，要利用 PyTorch 的自动微分以获得完整的训练支持，你通常需要实现并注册一份自定义的反向计算。否则，你就得用现有的可微原语把它组合出来。
+
+For training support, register an autograd formula using vector_add.register_autograd(backward, setup_context=setup_context). If you prefer, you can wrap the logic in a torch.autograd.Function and register both the forward and backward arguments. However, register_autograd is the recommended path for torch.compile composability.
+
+要支持训练，请使用 vector_add.register_autograd(backward, setup_context=setup_context) 注册一个自动微分公式。如果你愿意，也可以把逻辑包装进一个 torch.autograd.Function，并同时注册前向和反向参数。不过，register_autograd 才是获得 torch.compile 可组合性的推荐路径。
+
+> If OpenAI Triton doesn’t support something that you need—or doesn’t provide the performance that you expected—you can rewrite the kernel using CUDA C++ with a library like CUTLASS for efficiency. We would then register the CUDA C++ extension with PyTorch in a similar manner, including registering the autograd gradient computation for the backward pass.
+
+> 如果 OpenAI Triton 不支持你所需的某项功能——或者未能提供你所期望的性能——你可以借助像 CUTLASS 这样的库用 CUDA C++ 重写该核函数以获得更高效率。之后，我们会以类似的方式把该 CUDA C++ 扩展注册到 PyTorch，包括为反向传播注册自动微分梯度计算。
+
+### Tuning Kernel-Launch Parameters
+
+### 调优核函数启动参数
+
+Triton programs typically use 4 warps, or 128 threads, per block for many kernels. However, with modern GPU hardware’s larger shared memory and register file sizes per SM, you can typically push num_warps higher to 8 or 16 warps per block. For instance, you can increase num_warps to 8 when BLOCK_SIZE >= 2048 and to 16 when BLOCK_SIZE >= 4096.
+
+对许多核函数而言，Triton 程序通常每块使用 4 个 warp，即 128 个线程。然而，随着现代 GPU 硬件每个 SM 的共享内存和寄存器文件更大，你通常可以把 num_warps 提高到每块 8 或 16 个 warp。例如，你可以在 BLOCK_SIZE >= 2048 时把 num_warps 提高到 8，在 BLOCK_SIZE >= 4096 时提高到 16。
+
+The number of warps is dependent on whether your kernel can make use of the parallelism without causing excessive contention. The optimal setting depends on the kernel’s arithmetic intensity and memory access pattern.
+
+warp 的数量取决于你的核函数能否在不引发过度争用的情况下利用这种并行性。最优设置取决于核函数的算术强度和内存访问模式。
+
+Consider launching a kernel as follows: my_kernel[grid](..., num_warps=8). In this case, we are specifying 8 warps (256 threads) per Triton kernel. This configuration is typically effective for compute-heavy kernels. However, memory-bound kernels might still top out around 4 warps due to memory throughput limits.
+
+考虑如下方式启动核函数：my_kernel[grid](..., num_warps=8)。在这种情况下，我们为每个 Triton 核函数指定 8 个 warp（256 个线程）。这种配置对计算密集型核函数通常有效。然而，受内存带宽限制，内存受限型核函数可能仍会在约 4 个 warp 处触顶。
+
+For memory-bound kernels, using more warps per thread block can help hide memory latency by doing more in parallel. But too many warps per thread block can cause contention or cache thrashing.
+
+对于内存受限型核函数，每个线程块使用更多的 warp 有助于通过并行执行更多操作来隐藏内存延迟。但每个线程块的 warp 过多可能引发争用或缓存抖动。
+
+New GPU generations are gaining more SMs and wider memory buses. This lets us increase the number of warps per block from the default 4 warps to 8 or 16 warps. This helps to increase occupancy, cover more memory-access latency, and saturate the available memory and compute.
+
+新一代 GPU 拥有更多的 SM 和更宽的内存总线。这让我们能够把每块的 warp 数从默认的 4 个提高到 8 或 16 个。这有助于提升占用率（occupancy）、掩盖更多内存访问延迟，并使可用的内存与计算达到饱和。
+
+Manually exploring combinations of BLOCK_SIZE and num_warps for each kernel can be tedious. As such, it’s usually best to use Triton’s built-in autotuner. This will benchmark and automatically pick the optimal BLOCK_SIZE, num_warps, tile size, and other parameters for you. Let’s explore the autotuner in the next section.
+
+为每个核函数手动探索 BLOCK_SIZE 与 num_warps 的各种组合会很繁琐。因此，通常最好使用 Triton 内置的自动调优器。它会替你基准测试并自动挑选最优的 BLOCK_SIZE、num_warps、分块大小以及其他参数。下一节我们就来探讨自动调优器。
+
+### Autotuning Triton Kernels
+
+### 自动调优 Triton 核函数
+
+GPU kernel performance is highly sensitive to compile-time parameters such as tile dimensions, warp counts, loop unrolling stages, and the use of on-chip resources like registers and shared memory. Triton’s built-in autotuner automates the search for these optimal settings by letting you decorate a triton.jit kernel with @triton .autotune. You can pass in a list of triton.Config objects that describe the different candidate combinations of BLOCK_SIZE, num_warps, num_stages, tile size, and other kernel meta-parameters.
+
+GPU 核函数性能对编译期参数高度敏感，例如分块维度、warp 数量、循环展开阶段，以及对寄存器和共享内存等片上资源的使用。Triton 内置的自动调优器让你能够用 @triton.autotune 装饰一个 triton.jit 核函数，从而自动搜索这些最优设置。你可以传入一组 triton.Config 对象，用以描述 BLOCK_SIZE、num_warps、num_stages、分块大小以及其他核函数元参数的不同候选组合。
+
+During the first kernel invocation, the Triton JIT-compiles and benchmarks each configuration combination. Be sure to use a representative input workload on this initial invocation, as Triton will cache the fastest configuration for that input using a key derived from its characteristics, such as input size/shape.
+
+在首次调用核函数期间，Triton 会对每一种配置组合进行 JIT 编译并基准测试。请务必在这次初始调用时使用具有代表性的输入负载，因为 Triton 会根据从输入特征（如输入大小/形状）派生出的键，把最快的配置缓存起来，用于该输入。
+
+All subsequent calls that have these same input characteristics will automatically reuse the cached (fastest) configuration. This way, you only pay the autotuning cost once for each input size/shape—and immediately start benefiting from the optimal configuration in later kernel invocations.
+
+此后所有具有相同输入特征的调用都会自动复用已缓存的（最快的）配置。这样，你只需为每种输入大小/形状支付一次自动调优的成本——并可在之后的核函数调用中立即受益于最优配置。
+
+If Triton detects a new input shape, it will perform another autotune process by iterating through the triton.Config objects using the new input characteristics. It will again choose the best configuration for this input and cache it for subsequent kernel invocations.
+
+如果 Triton 检测到新的输入形状，它会针对新的输入特征再次遍历 triton.Config 对象，执行一次新的自动调优过程。它会再次为该输入选出最佳配置，并将其缓存以供后续核函数调用使用。
+
+To avoid suboptimal tuning results, it’s recommended that you warm up the autotuner with realistic and representative inputs that closely match your production workload. This way, Triton populates the cache with an optimal configuration that closely reflects your production inputs.
+
+为避免次优的调优结果，建议你用贴近生产负载的真实且有代表性的输入来预热自动调优器。这样，Triton 便能用一份紧密反映你生产输入的最优配置来填充缓存。
+
+> You can override the optimal settings for specific input shapes and workloads by supplying a custom key_fn to @triton.autotune(key_fn=...) that maps the input metadata (e.g., tensor shapes) to a custom cache key. This is an advanced technique that gives you more control of the cache configurations for different types of input workloads.
+
+> 你可以通过向 @triton.autotune(key_fn=...) 提供自定义的 key_fn，把输入元数据（如张量形状）映射到自定义缓存键，从而针对特定的输入形状和负载覆盖最优设置。这是一项高阶技巧，能让你对不同类型输入负载的缓存配置拥有更多控制权。
+
+When choosing possible kernel configurations, it’s worth remembering that larger tiles and more warps will increase arithmetic intensity at the expense of consuming additional registers and shared memory per thread block. In other words, by increasing the compute-to-memory ratio, you limit occupancy since fewer thread blocks can execute on each SM due to the increased resource needs.
+
+在选择可能的核函数配置时，值得记住的是：更大的分块和更多的 warp 会以消耗每个线程块更多的寄存器和共享内存为代价，提升算术强度。换言之，提高计算与内存之比会限制占用率，因为资源需求增加，能在每个 SM 上执行的线程块变少。
+
+Conversely, using smaller tiles and fewer warps will reduce per-thread work and data reuse but allow more blocks and warps to be active on each SM concurrently. This improves occupancy at the expense of lower arithmetic intensity.
+
+反过来，使用更小的分块和更少的 warp 会减少每线程的工作量与数据复用，但允许每个 SM 上并发活跃更多的块和 warp。这以更低的算术强度为代价换取更高的占用率。
+
+In short, the optimal trade-off depends on both your input-matrix dimensions and your GPU’s specific resource limits. Manually tuning is time-consuming and error-prone. Triton’s autotuner handles this complexity automatically using a data-driven approach on realistic workloads to determine the optimal configuration that a manual search might miss. Using higher num_warps (e.g., 8–16) and multistage pipelining will often saturate tcgen05.* paths on Blackwell. It’s recommended to use autotuning as much as possible.
+
+简言之，最优的权衡取决于你的输入矩阵维度以及 GPU 的具体资源上限。手动调优既耗时又易出错。Triton 的自动调优器会以数据驱动的方式在真实负载上自动处理这种复杂性，确定手动搜索可能错过的最优配置。使用更高的 num_warps（例如 8–16）以及多阶段流水线，往往能在 Blackwell 上使 tcgen05.* 路径达到饱和。建议尽可能多地使用自动调优。
+
+## Advanced Triton Kernel Implementations
+
+## 进阶 Triton 核函数实现
+
+To solidify these concepts, next are some self-contained Triton kernel examples for warp specialization and asynchronous double buffering of data transfers/computations. These illustrate how you can implement Triton to transform high-level Python code into highly optimized GPU kernels.
+
+为巩固这些概念，接下来给出一些自包含的 Triton 核函数示例，涉及 warp 专门化以及数据传输/计算的异步双缓冲。它们展示了如何用 Triton 把高层 Python 代码转化为高度优化的 GPU 核函数。
+
+### Warp Specialization with Triton
+
+### 用 Triton 实现 warp 专门化
+
+TorchInductor can target Triton’s warp specialization support for many of its generated GPU kernels. It will try to split each thread block’s warps into “producer” (memory) and “consumer” (compute) roles by emitting tl.range() loops with warp_specialize=True, similar to the example shown here:
+
+TorchInductor 可以为其生成的许多 GPU 核函数瞄准 Triton 的 warp 专门化支持。它会尝试把每个线程块的 warp 拆分为“生产者”（内存）和“消费者”（计算）两种角色，做法是发出带 warp_specialize=True 的 tl.range() 循环，类似下面所示的示例：
+
+```
+// warp_specialize=True is supported on modern GPUs
+// Use it together with num_stages > 1
+// to enable producer/consumer warp partitioning
+// and overlap
+for k in tl.range(0, K_tiles, _warn_unused=False, warp_specialize=True):
+    # loop body
+    ...
+```
+
+```
+// warp_specialize=True is supported on modern GPUs
+// Use it together with num_stages > 1
+// to enable producer/consumer warp partitioning
+// and overlap
+for k in tl.range(0, K_tiles, _warn_unused=False, warp_specialize=True):
+    # loop body
+    ...
+```
+
+The memory warp prefetches the next tile while another warp computes the current tile. This will overlap memory latency with computation to produce higher throughput. Warp specialization works hand-in-hand with descriptor-based TMA copies. You can also use this in your own custom Triton kernels by passing warp_specialize=True to tl.range(), as shown in the code.
+
+内存 warp 会在另一个 warp 计算当前分块的同时预取下一个分块。这会将内存延迟与计算重叠，从而带来更高的吞吐量。warp 专门化与基于描述符的 TMA 拷贝协同工作。你也可以在自己的自定义 Triton 核函数中使用它，方法是向 tl.range() 传入 warp_specialize=True，如代码所示。
+
+You can also drive warp specialization through Triton autotune configs by setting num_consumer_groups>0 (e.g., 2) and num_buffers_warp_spec (e.g., 3) in triton .Config as shown in the following code snippet. This will keep the producers and consumers busy with work. If provided, TorchInductor will use these values under the hood:
+
+你还可以通过 Triton 自动调优配置来驱动 warp 专门化，做法是在 triton.Config 中设置 num_consumer_groups>0（例如 2）和 num_buffers_warp_spec（例如 3），如下面的代码片段所示。这会让生产者和消费者始终保持忙碌。如果提供了这些值，TorchInductor 会在底层使用它们：
+
+```
+triton.Config(
+    { 'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 64,
+      'num_warps': 8, 'num_stages': 2,
+      'num_consumer_groups': 2, '
+      num_buffers_warp_spec': 3 }
+)
+```
+
+```
+triton.Config(
+    { 'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 64,
+      'num_warps': 8, 'num_stages': 2,
+      'num_consumer_groups': 2, '
+      num_buffers_warp_spec': 3 }
+)
+```
+
+This specialization approach is especially effective for long-running loops that iterate over a large *K* dimension in a GEMM. This dedicated approach keeps both the memory subsystem and the ALUs busy at all times and maximizes hardware utilization.
+
+这种专门化方法对于在 GEMM 中反复迭代一个较大 *K* 维度的长时间运行循环尤其有效。这种专职分工的方式让内存子系统和 ALU 始终保持忙碌，从而最大化硬件利用率。
+
+### Tiled and Persistent GEMM Kernel (Triton)
+
+### 分块与持久化 GEMM 核函数（Triton）
+
+This Triton kernel computes a matrix multiplication (C = A * B) efficiently since each kernel launch does all the work by looping over the K dimension internally, instead of launching multiple kernels for each K chunk. This way, we pay the launch overhead only once, and warps stay busy until every tile is done. The following example tiles over K inside one launch but does not reuse the same thread block across multiple output tiles:
+
+这个 Triton 核函数高效地计算矩阵乘法（C = A * B），因为每次核函数启动都通过内部对 K 维度循环来完成全部工作，而不是为每个 K 分块启动多个核函数。这样，我们只需支付一次启动开销，并且 warp 会一直保持忙碌，直到每个分块都完成。下面的示例在一次启动内对 K 进行分块，但不会在多个输出分块之间复用同一个线程块：
+
+```
+@triton.jit
+def tiled_gemm_kernel(
+    A_ptr, B_ptr, C_ptr,
+    M, N, K,
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    """
+    Tiled GEMM with Triton tensor descriptors + autotuning.
+
+    This is the BASIC PRODUCTION example showing:
+    1. Tensor descriptors (maps to TMA on Blackwell)
+    2. Autotuning across block sizes
+    3. Standard 2D grid decomposition
+    """
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    m0 = pid_m * BLOCK_M
+    n0 = pid_n * BLOCK_N
+    offs_m = m0 + tl.arange(0, BLOCK_M)
+    offs_n = n0 + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+    # On Blackwell, descriptor .load/.store map to TMA
+    # tl.dot lowers to UMMA (tcgen05) with accumulators in TMEM.
+    A_desc = tl.make_tensor_descriptor(
+        A_ptr,
+        shape=[M, K],
+        strides=[stride_am, stride_ak],
+        block_shape=[BLOCK_M, BLOCK_K],
+    )
+    B_desc = tl.make_tensor_descriptor(
+        B_ptr,
+        shape=[K, N],
+        strides=[stride_bk, stride_bn],
+        block_shape=[BLOCK_K, BLOCK_N],
+    )
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    K_tiles = (K + BLOCK_K - 1) // BLOCK_K
+    if K_tiles == 0:
+        c_ptrs = C_ptr + (offs_m[:, None] * stride_cm
+                          + offs_n[None, :] * stride_cn)
+        c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+        tl.store(c_ptrs, acc, mask=c_mask)
+        return
+    k0 = 0
+    if (m0 + BLOCK_M <= M) and (k0 + BLOCK_K <= K):
+        a_cur = A_desc.load([m0, k0])
+    else:
+        col_ids = k0 + offs_k
+        row_offsets = offs_m[:, None] + tl.zeros((BLOCK_M, BLOCK_K),
+                                                  dtype=offs_m.dtype)
+        col_offsets = col_ids[None, :] + tl.zeros((BLOCK_M, BLOCK_K),
+                                                   dtype=col_ids.dtype)
+        a_cur = tl.load(
+            A_desc,
+            offsets=(row_offsets, col_offsets),
+            boundary_check=(0, 1),
+            padding_option="zero",
+        )
+    if (n0 + BLOCK_N <= N) and (k0 + BLOCK_K <= K):
+        b_cur = B_desc.load([k0, n0])
+    else:
+        row_ids = k0 + offs_k
+        row_offsets = row_ids[:, None] + tl.zeros((BLOCK_K, BLOCK_N),
+                                                   dtype=row_ids.dtype)
+        col_offsets = offs_n[None, :] + tl.zeros((BLOCK_K, BLOCK_N),
+                                                  dtype=offs_n.dtype)
+        b_cur = tl.load(
+            B_desc,
+            offsets=(row_offsets, col_offsets),
+            boundary_check=(0, 1),
+            padding_option="zero",
+        )
+    for kt in tl.range(0, K_tiles, num_stages=2):
+        k0 = kt * BLOCK_K
+        acc += tl.dot(a_cur, b_cur)
+        next_k = k0 + BLOCK_K
+        if next_k < K:
+            if (m0 + BLOCK_M <= M) and (next_k + BLOCK_K <= K):
+                a_cur = A_desc.load([m0, next_k])
+            else:
+                col_ids = next_k + offs_k
+                row_offsets = offs_m[:, None] + tl.zeros((BLOCK_M, BLOCK_K),
+                                                          dtype=offs_m.dtype)
+                col_offsets = col_ids[None, :] + tl.zeros((BLOCK_M, BLOCK_K),
+                                                           dtype=col_ids.dtype)
+                a_cur = tl.load(
+                    A_desc,
+                    offsets=(row_offsets, col_offsets),
+                    boundary_check=(0, 1),
+                    padding_option="zero",
+                )
+            if (n0 + BLOCK_N <= N) and (next_k + BLOCK_K <= K):
+                b_cur = B_desc.load([next_k, n0])
+            else:
+                row_ids = next_k + offs_k
+                row_offsets = row_ids[:, None] + tl.zeros((BLOCK_K, BLOCK_N),
+                                                           dtype=row_ids.dtype)
+                col_offsets = offs_n[None, :] + tl.zeros((BLOCK_K, BLOCK_N),
+                                                          dtype=offs_n.dtype)
+                b_cur = tl.load(
+                    B_desc,
+                    offsets=(row_offsets, col_offsets),
+                    boundary_check=(0, 1),
+                    padding_option="zero",
+                )
+    # Store results with masking
+    c_ptrs = C_ptr + (offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn)
+    c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(c_ptrs, acc, mask=c_mask)
+
+def persistent_matmul(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+    M, K = A.shape
+    K2, N = B.shape
+    assert K == K2
+    C = torch.empty((M, N), device=A.device, dtype=torch.float32)
+    MT = triton.cdiv(M, 128)
+    NT = triton.cdiv(N, 128)
+    grid = lambda META: (min(65536, MT * NT),)  # bound launch overhead
+    matmul_kernel_persistent[grid](
+        A, B, C, M, N, K,
+        A.stride(0), A.stride(1),
+        B.stride(0), B.stride(1),
+        C.stride(0), C.stride(1),
+    )
+    return C
+```
+
+```
+@triton.jit
+def tiled_gemm_kernel(
+    A_ptr, B_ptr, C_ptr,
+    M, N, K,
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    """
+    Tiled GEMM with Triton tensor descriptors + autotuning.
+
+    This is the BASIC PRODUCTION example showing:
+    1. Tensor descriptors (maps to TMA on Blackwell)
+    2. Autotuning across block sizes
+    3. Standard 2D grid decomposition
+    """
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    m0 = pid_m * BLOCK_M
+    n0 = pid_n * BLOCK_N
+    offs_m = m0 + tl.arange(0, BLOCK_M)
+    offs_n = n0 + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+    # On Blackwell, descriptor .load/.store map to TMA
+    # tl.dot lowers to UMMA (tcgen05) with accumulators in TMEM.
+    A_desc = tl.make_tensor_descriptor(
+        A_ptr,
+        shape=[M, K],
+        strides=[stride_am, stride_ak],
+        block_shape=[BLOCK_M, BLOCK_K],
+    )
+    B_desc = tl.make_tensor_descriptor(
+        B_ptr,
+        shape=[K, N],
+        strides=[stride_bk, stride_bn],
+        block_shape=[BLOCK_K, BLOCK_N],
+    )
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    K_tiles = (K + BLOCK_K - 1) // BLOCK_K
+    if K_tiles == 0:
+        c_ptrs = C_ptr + (offs_m[:, None] * stride_cm
+                          + offs_n[None, :] * stride_cn)
+        c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+        tl.store(c_ptrs, acc, mask=c_mask)
+        return
+    k0 = 0
+    if (m0 + BLOCK_M <= M) and (k0 + BLOCK_K <= K):
+        a_cur = A_desc.load([m0, k0])
+    else:
+        col_ids = k0 + offs_k
+        row_offsets = offs_m[:, None] + tl.zeros((BLOCK_M, BLOCK_K),
+                                                  dtype=offs_m.dtype)
+        col_offsets = col_ids[None, :] + tl.zeros((BLOCK_M, BLOCK_K),
+                                                   dtype=col_ids.dtype)
+        a_cur = tl.load(
+            A_desc,
+            offsets=(row_offsets, col_offsets),
+            boundary_check=(0, 1),
+            padding_option="zero",
+        )
+    if (n0 + BLOCK_N <= N) and (k0 + BLOCK_K <= K):
+        b_cur = B_desc.load([k0, n0])
+    else:
+        row_ids = k0 + offs_k
+        row_offsets = row_ids[:, None] + tl.zeros((BLOCK_K, BLOCK_N),
+                                                   dtype=row_ids.dtype)
+        col_offsets = offs_n[None, :] + tl.zeros((BLOCK_K, BLOCK_N),
+                                                  dtype=offs_n.dtype)
+        b_cur = tl.load(
+            B_desc,
+            offsets=(row_offsets, col_offsets),
+            boundary_check=(0, 1),
+            padding_option="zero",
+        )
+    for kt in tl.range(0, K_tiles, num_stages=2):
+        k0 = kt * BLOCK_K
+        acc += tl.dot(a_cur, b_cur)
+        next_k = k0 + BLOCK_K
+        if next_k < K:
+            if (m0 + BLOCK_M <= M) and (next_k + BLOCK_K <= K):
+                a_cur = A_desc.load([m0, next_k])
+            else:
+                col_ids = next_k + offs_k
+                row_offsets = offs_m[:, None] + tl.zeros((BLOCK_M, BLOCK_K),
+                                                          dtype=offs_m.dtype)
+                col_offsets = col_ids[None, :] + tl.zeros((BLOCK_M, BLOCK_K),
+                                                           dtype=col_ids.dtype)
+                a_cur = tl.load(
+                    A_desc,
+                    offsets=(row_offsets, col_offsets),
+                    boundary_check=(0, 1),
+                    padding_option="zero",
+                )
+            if (n0 + BLOCK_N <= N) and (next_k + BLOCK_K <= K):
+                b_cur = B_desc.load([next_k, n0])
+            else:
+                row_ids = next_k + offs_k
+                row_offsets = row_ids[:, None] + tl.zeros((BLOCK_K, BLOCK_N),
+                                                           dtype=row_ids.dtype)
+                col_offsets = offs_n[None, :] + tl.zeros((BLOCK_K, BLOCK_N),
+                                                          dtype=offs_n.dtype)
+                b_cur = tl.load(
+                    B_desc,
+                    offsets=(row_offsets, col_offsets),
+                    boundary_check=(0, 1),
+                    padding_option="zero",
+                )
+    # Store results with masking
+    c_ptrs = C_ptr + (offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn)
+    c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(c_ptrs, acc, mask=c_mask)
+
+def persistent_matmul(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+    M, K = A.shape
+    K2, N = B.shape
+    assert K == K2
+    C = torch.empty((M, N), device=A.device, dtype=torch.float32)
+    MT = triton.cdiv(M, 128)
+    NT = triton.cdiv(N, 128)
+    grid = lambda META: (min(65536, MT * NT),)  # bound launch overhead
+    matmul_kernel_persistent[grid](
+        A, B, C, M, N, K,
+        A.stride(0), A.stride(1),
+        B.stride(0), B.stride(1),
+        C.stride(0), C.stride(1),
+    )
+    return C
+```
+
+Here, the kernel launches a 2-D grid over the M×N tiles and performs the full K-loop inside a single kernel launch. This reduces launch overhead and can increase utilization when K is large, but comes at the cost of holding resources longer in a single kernel. Each program (thread block) loads tiles of A and B into shared memory and computes a partial dot product of the tiles with tl.dot. Triton accumulates the results in FP32. And, on Blackwell, Triton lowers the tl.dot to tcgen05 and UMMA to engage the Tensor Cores. The Tensor Cores then accumulate results in specialized TMEM rather than general registers.
+
+在这里，核函数在 M×N 分块上启动一个二维网格，并在单次核函数启动内部执行完整的 K 循环。这减少了启动开销，并在 K 较大时能提升利用率，但代价是在单个核函数中占用资源的时间更长。每个程序（线程块）把 A 和 B 的分块加载到共享内存中，并用 tl.dot 计算这些分块的部分点积。Triton 以 FP32 累加结果。而在 Blackwell 上，Triton 会把 tl.dot 下降为 tcgen05 和 UMMA，以调用张量核心。张量核心随后会在专用的 TMEM 中累加结果，而不是在通用寄存器中。
+
+> It’s best to express shared-memory–backed tile movement in Triton using tensor descriptors. For instance, desc=tl.make_tensor_ descriptor(...). On modern GPUs, these tensor-descriptor calls map to TMA-based hardware operations using asynchronous, coalesced transfers.
+
+> 在 Triton 中，最好使用张量描述符来表达由共享内存支撑的分块搬运。例如 desc=tl.make_tensor_descriptor(...)。在现代 GPU 上，这些张量描述符调用会映射到基于 TMA 的硬件操作，使用异步、合并的传输。
+
+Triton will unroll/vectorize these loops and computations for efficiency. In addition, when dtypes and tile shapes are supported (e.g., FP16/BF16, or TF32 for FP32), Triton lowers tl.dot to Tensor Core instructions. Here is a simple Python wrapper that launches this Triton kernel:
+
+Triton 会为提升效率而展开/向量化这些循环与计算。此外，当数据类型和分块形状受支持时（例如 FP16/BF16，或用于 FP32 的 TF32），Triton 会把 tl.dot 下降为张量核心指令。下面是一个用于启动该 Triton 核函数的简单 Python 包装器：
+
+```
+def tiled_matmul(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+    """
+    Tiled matrix multiplication using autotuned Triton kernel.
+
+    The kernel will automatically select the best block size configuration
+    for the given matrix dimensions (M, N, K).
+    """
+    M, K = A.shape
+    K2, N = B.shape
+    assert K == K2, f"Inner dimensions must match: {K} != {K2}"
+    C = torch.empty((M, N), device=A.device, dtype=torch.float32)
+    # Grid is computed based on max block size from autotuning configs
+    # Triton's autotuner will pick the optimal block size at runtime
+    MAX_BLOCK_M = 128  # From largest config
+    MAX_BLOCK_N = 128
+    grid = (triton.cdiv(M, MAX_BLOCK_M), triton.cdiv(N, MAX_BLOCK_N))
+    # Launch with autotuning - Triton will select best config
+    tiled_gemm_kernel[grid](
+        A, B, C, M, N, K,
+        A.stride(0), A.stride(1),
+        B.stride(0), B.stride(1),
+        C.stride(0), C.stride(1),
+    )
+    return C
+```
+
+```
+def tiled_matmul(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+    """
+    Tiled matrix multiplication using autotuned Triton kernel.
+
+    The kernel will automatically select the best block size configuration
+    for the given matrix dimensions (M, N, K).
+    """
+    M, K = A.shape
+    K2, N = B.shape
+    assert K == K2, f"Inner dimensions must match: {K} != {K2}"
+    C = torch.empty((M, N), device=A.device, dtype=torch.float32)
+    # Grid is computed based on max block size from autotuning configs
+    # Triton's autotuner will pick the optimal block size at runtime
+    MAX_BLOCK_M = 128  # From largest config
+    MAX_BLOCK_N = 128
+    grid = (triton.cdiv(M, MAX_BLOCK_M), triton.cdiv(N, MAX_BLOCK_N))
+    # Launch with autotuning - Triton will select best config
+    tiled_gemm_kernel[grid](
+        A, B, C, M, N, K,
+        A.stride(0), A.stride(1),
+        B.stride(0), B.stride(1),
+        C.stride(0), C.stride(1),
+    )
+    return C
+```
+
+Here, we see that by doing the entire K-loop inside one kernel launch, we avoid launching multiple kernels per output tile. On modern GPUs, this approach can increase utilization when K is large—at the cost of holding resources for longer in a single kernel.
+
+这里可以看到，通过把整个 K 循环放在单次核函数启动内部完成，我们避免了为每个输出分块都启动多个核函数。在现代 GPU 上，当 K 很大时，这种做法可以提升利用率——代价是在单个核函数中占用资源的时间更长。
+
+You can combine this tiled approach with a persistent kernel. This would reuse the same thread block across multiple output tiles. The persistent kernel would use a 1-D grid and stride the tile index by tl.num_programs(0) as shown in this code block:
+
+你可以把这种分块方式与持久化核函数（persistent kernel）结合起来。这样就能在多个输出分块之间复用同一个线程块。持久化核函数会使用一维网格（1-D grid），并以 tl.num_programs(0) 为步长来推进分块索引，如下面这段代码所示：
+
+```
+@triton.jit
+def matmul_kernel_persistent(
+    A_ptr, B_ptr, C_ptr,
+    M, N, K,
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    # compile-time constants
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    NUM_STAGES: tl.constexpr,
+):
+    """
+    Persistent thread GEMM with Triton tensor descriptors + autotuning.
+    Key Blackwell Optimizations:
+      1) Tensor descriptors -> TMA hardware acceleration
+      2) Autotuning across multiple block-size configurations
+      3) Persistent threads to amortize launch overhead
+      4) TMEM accumulation (accumulators live in ~256 KB/SM TMEM on Blackwell)
+    This is the PRODUCTION-READY version combining these best practices.
+    """
+    # 1-D persistent launch: each program processes multiple tiles
+    pid   = tl.program_id(0)
+    nprog = tl.num_programs(0)
+    MT = tl.cdiv(M, BLOCK_M)
+    NT = tl.cdiv(N, BLOCK_N)
+    TILE_COUNT = MT * NT
+    # --- Tensor descriptors (map to TMA on NVIDIA). Descriptor rules:
+    #     leading strides must be multiples of 16 BYTES;
+    #     last dimension contiguous.
+    A_desc = tl.make_tensor_descriptor(
+        A_ptr, shape=[M, K], strides=[stride_am, stride_ak],
+        block_shape=[BLOCK_M, BLOCK_K],
+    )
+    B_desc = tl.make_tensor_descriptor(
+        B_ptr, shape=[K, N], strides=[stride_bk, stride_bn],
+        block_shape=[BLOCK_K, BLOCK_N],
+    )
+    # Persistent stride over all output tiles handled by this program.
+    tile_idx = pid
+    while tile_idx < TILE_COUNT:
+        pid_m = tile_idx // NT
+        pid_n = tile_idx %  NT
+        m0 = pid_m * BLOCK_M
+        n0 = pid_n * BLOCK_N
+        offs_m = m0 + tl.arange(0, BLOCK_M)
+        offs_n = n0 + tl.arange(0, BLOCK_N)
+        offs_k = tl.arange(0, BLOCK_K)
+        # FP32 accumulator (on Blackwell, accumulators live in TMEM,
+        # not registers)
+        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        # ---- K loop (double-buffered ring-of-two using descriptors -> TMA) ----
+        K_tiles = (K + BLOCK_K - 1) // BLOCK_K
+        if K_tiles == 0:
+            # Masked store of zeros when K == 0
+            c_ptrs = C_ptr + (offs_m[:, None] * stride_cm + offs_n[None, :]
+                              * stride_cn)
+            c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+            tl.store(c_ptrs, acc, mask=c_mask)
+            tile_idx += nprog
+            continue
+        # Prefetch first CURRENT tiles
+        k0 = 0
+        if (m0 + BLOCK_M <= M) and (k0 + BLOCK_K <= K):
+            a_cur = A_desc.load([m0, k0])
+        else:
+            row_offsets = offs_m[:, None] + tl.zeros((BLOCK_M, BLOCK_K),
+                                                      dtype=offs_m.dtype)
+            col_offsets = (k0 + offs_k)[None, :] + tl.zeros((BLOCK_M, BLOCK_K),
+                                                             dtype=offs_k.dtype)
+            a_cur = tl.load(A_desc, offsets=(row_offsets, col_offsets),
+                            boundary_check=(0, 1), padding_option="zero")
+        if (n0 + BLOCK_N <= N) and (k0 + BLOCK_K <= K):
+            b_cur = B_desc.load([k0, n0])
+        else:
+            row_offsets = (k0 + offs_k)[:, None] + tl.zeros((BLOCK_K, BLOCK_N),
+                                                             dtype=offs_k.dtype)
+            col_offsets = offs_n[None, :] + tl.zeros((BLOCK_K, BLOCK_N),
+                                                      dtype=offs_n.dtype)
+            b_cur = tl.load(B_desc, offsets=(row_offsets, col_offsets),
+                            boundary_check=(0, 1), padding_option="zero")
+
+        # Pipeline: prefetch-NEXT -> compute-CURRENT -> swap
+        for kt in tl.range(0, K_tiles, num_stages=NUM_STAGES,
+                           warp_specialize=True):
+            next_k = (kt + 1) * BLOCK_K
+            if kt + 1 < K_tiles:
+                if (m0 + BLOCK_M <= M) and (next_k + BLOCK_K <= K):
+                    a_next = A_desc.load([m0, next_k])
+                else:
+                    row_offsets = offs_m[:, None] + tl.zeros((BLOCK_M, BLOCK_K),
+                                                              dtype=offs_m.dtype)
+                    col_offsets = (next_k + offs_k)[None, :]
+                                   + tl.zeros((BLOCK_M, BLOCK_K),
+                                   dtype=offs_k.dtype)
+                    a_next = tl.load(A_desc, offsets=(row_offsets, col_offsets),
+                                     boundary_check=(0, 1),
+                                     padding_option="zero")
+                if (n0 + BLOCK_N <= N) and (next_k + BLOCK_K <= K):
+                    b_next = B_desc.load([next_k, n0])
+                else:
+                    row_offsets = (next_k + offs_k)[:, None]
+                                   + tl.zeros((BLOCK_K, BLOCK_N),
+                                   dtype=offs_k.dtype)
+                    col_offsets = offs_n[None, :] + tl.zeros((BLOCK_K, BLOCK_N),
+                                                              dtype=offs_n.dtype)
+                    b_next = tl.load(B_desc, offsets=(row_offsets, col_offsets),
+                                     boundary_check=(0, 1),
+                                     padding_option="zero")
+            # Compute on CURRENT tiles (UMMA on Blackwell; accumulators in TMEM)
+            acc += tl.dot(a_cur, b_cur)
+            # Swap in the prefetched NEXT tiles
+            if kt + 1 < K_tiles:
+                a_cur = a_next
+                b_cur = b_next
+        # ---- Store C with masking --------------------------------------------
+        c_ptrs = C_ptr + (offs_m[:, None] * stride_cm
+                          + offs_n[None, :] * stride_cn)
+        c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+        tl.store(c_ptrs, acc, mask=c_mask)
+        # Advance to the next tile handled by this program (persistent stepping)
+        tile_idx += nprog
+```
+
+```
+@triton.jit
+def matmul_kernel_persistent(
+    A_ptr, B_ptr, C_ptr,
+    M, N, K,
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    # compile-time constants
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    NUM_STAGES: tl.constexpr,
+):
+    """
+    Persistent thread GEMM with Triton tensor descriptors + autotuning.
+    Key Blackwell Optimizations:
+      1) Tensor descriptors -> TMA hardware acceleration
+      2) Autotuning across multiple block-size configurations
+      3) Persistent threads to amortize launch overhead
+      4) TMEM accumulation (accumulators live in ~256 KB/SM TMEM on Blackwell)
+    This is the PRODUCTION-READY version combining these best practices.
+    """
+    # 1-D persistent launch: each program processes multiple tiles
+    pid   = tl.program_id(0)
+    nprog = tl.num_programs(0)
+    MT = tl.cdiv(M, BLOCK_M)
+    NT = tl.cdiv(N, BLOCK_N)
+    TILE_COUNT = MT * NT
+    # --- Tensor descriptors (map to TMA on NVIDIA). Descriptor rules:
+    #     leading strides must be multiples of 16 BYTES;
+    #     last dimension contiguous.
+    A_desc = tl.make_tensor_descriptor(
+        A_ptr, shape=[M, K], strides=[stride_am, stride_ak],
+        block_shape=[BLOCK_M, BLOCK_K],
+    )
+    B_desc = tl.make_tensor_descriptor(
+        B_ptr, shape=[K, N], strides=[stride_bk, stride_bn],
+        block_shape=[BLOCK_K, BLOCK_N],
+    )
+    # Persistent stride over all output tiles handled by this program.
+    tile_idx = pid
+    while tile_idx < TILE_COUNT:
+        pid_m = tile_idx // NT
+        pid_n = tile_idx %  NT
+        m0 = pid_m * BLOCK_M
+        n0 = pid_n * BLOCK_N
+        offs_m = m0 + tl.arange(0, BLOCK_M)
+        offs_n = n0 + tl.arange(0, BLOCK_N)
+        offs_k = tl.arange(0, BLOCK_K)
+        # FP32 accumulator (on Blackwell, accumulators live in TMEM,
+        # not registers)
+        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        # ---- K loop (double-buffered ring-of-two using descriptors -> TMA) ----
+        K_tiles = (K + BLOCK_K - 1) // BLOCK_K
+        if K_tiles == 0:
+            # Masked store of zeros when K == 0
+            c_ptrs = C_ptr + (offs_m[:, None] * stride_cm + offs_n[None, :]
+                              * stride_cn)
+            c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+            tl.store(c_ptrs, acc, mask=c_mask)
+            tile_idx += nprog
+            continue
+        # Prefetch first CURRENT tiles
+        k0 = 0
+        if (m0 + BLOCK_M <= M) and (k0 + BLOCK_K <= K):
+            a_cur = A_desc.load([m0, k0])
+        else:
+            row_offsets = offs_m[:, None] + tl.zeros((BLOCK_M, BLOCK_K),
+                                                      dtype=offs_m.dtype)
+            col_offsets = (k0 + offs_k)[None, :] + tl.zeros((BLOCK_M, BLOCK_K),
+                                                             dtype=offs_k.dtype)
+            a_cur = tl.load(A_desc, offsets=(row_offsets, col_offsets),
+                            boundary_check=(0, 1), padding_option="zero")
+        if (n0 + BLOCK_N <= N) and (k0 + BLOCK_K <= K):
+            b_cur = B_desc.load([k0, n0])
+        else:
+            row_offsets = (k0 + offs_k)[:, None] + tl.zeros((BLOCK_K, BLOCK_N),
+                                                             dtype=offs_k.dtype)
+            col_offsets = offs_n[None, :] + tl.zeros((BLOCK_K, BLOCK_N),
+                                                      dtype=offs_n.dtype)
+            b_cur = tl.load(B_desc, offsets=(row_offsets, col_offsets),
+                            boundary_check=(0, 1), padding_option="zero")
+
+        # Pipeline: prefetch-NEXT -> compute-CURRENT -> swap
+        for kt in tl.range(0, K_tiles, num_stages=NUM_STAGES,
+                           warp_specialize=True):
+            next_k = (kt + 1) * BLOCK_K
+            if kt + 1 < K_tiles:
+                if (m0 + BLOCK_M <= M) and (next_k + BLOCK_K <= K):
+                    a_next = A_desc.load([m0, next_k])
+                else:
+                    row_offsets = offs_m[:, None] + tl.zeros((BLOCK_M, BLOCK_K),
+                                                              dtype=offs_m.dtype)
+                    col_offsets = (next_k + offs_k)[None, :]
+                                   + tl.zeros((BLOCK_M, BLOCK_K),
+                                   dtype=offs_k.dtype)
+                    a_next = tl.load(A_desc, offsets=(row_offsets, col_offsets),
+                                     boundary_check=(0, 1),
+                                     padding_option="zero")
+                if (n0 + BLOCK_N <= N) and (next_k + BLOCK_K <= K):
+                    b_next = B_desc.load([next_k, n0])
+                else:
+                    row_offsets = (next_k + offs_k)[:, None]
+                                   + tl.zeros((BLOCK_K, BLOCK_N),
+                                   dtype=offs_k.dtype)
+                    col_offsets = offs_n[None, :] + tl.zeros((BLOCK_K, BLOCK_N),
+                                                              dtype=offs_n.dtype)
+                    b_next = tl.load(B_desc, offsets=(row_offsets, col_offsets),
+                                     boundary_check=(0, 1),
+                                     padding_option="zero")
+            # Compute on CURRENT tiles (UMMA on Blackwell; accumulators in TMEM)
+            acc += tl.dot(a_cur, b_cur)
+            # Swap in the prefetched NEXT tiles
+            if kt + 1 < K_tiles:
+                a_cur = a_next
+                b_cur = b_next
+        # ---- Store C with masking --------------------------------------------
+        c_ptrs = C_ptr + (offs_m[:, None] * stride_cm
+                          + offs_n[None, :] * stride_cn)
+        c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+        tl.store(c_ptrs, acc, mask=c_mask)
+        # Advance to the next tile handled by this program (persistent stepping)
+        tile_idx += nprog
+```
+
+This persistent approach aligns well with modern GPUs, which have relatively large register files, shared memory, and L2 cache. These can accommodate larger tile sizes (BLOCK_K). This means more of the K-loop can be unrolled per iteration.
+
+这种持久化方式非常契合现代 GPU，因为它们拥有相对较大的寄存器文件、共享内存和 L2 缓存。这些资源能够容纳更大的分块尺寸（BLOCK_K）。这意味着每次迭代可以展开更多的 K 循环。
+
+A persistent kernel like this will usually outperform a sequence of smaller matmul kernels—especially when K is very large (e.g., > 1,024). The trade-off is that one SM is occupied longer. But if the kernel can fully utilize the SM, this is often ideal.
+
+像这样的持久化核函数通常会胜过一连串较小的矩阵乘核函数——尤其是当 K 非常大（例如 > 1,024）时。其权衡在于单个 SM 会被占用更长时间。但如果核函数能够充分利用该 SM，这往往是理想的。
+
+In the preceding code, you can experiment with increasing BLOCK_K on modern GPUs since they have increased on-chip memory and can handle more data per tile.
+
+在前面的代码中，你可以尝试在现代 GPU 上增大 BLOCK_K，因为它们拥有更大的片上内存，每个分块能够处理更多数据。
+
+However, beyond a certain point, register pressure may increase and lead to register spilling. As such, it’s always important to profile and find the right balance for your workload and hardware.
+
+不过，超过某个临界点之后，寄存器压力可能会上升，并导致寄存器溢出（register spilling）。因此，务必进行剖析，为你的工作负载和硬件找到恰当的平衡点。
+
+### Software Pipelining and Double Buffering with Triton
+
+### 使用 Triton 实现软件流水线与双缓冲
+
+This example shows how to implement double buffering with Triton. Double buffering, a two-stage form of software pipelining, overlaps memory loads and computations in a single loop.
+
+这个示例展示了如何用 Triton 实现双缓冲。双缓冲是软件流水线的一种两阶段形式，它在单个循环中把内存加载与计算重叠起来。
+
+On modern NVIDIA GPUs, asynchronous global-to-shared copies allow multiple in-flight stages of prefetch to overlap memory transfers with compute. This makes double buffering (and triple buffering, etc.) a valuable and important performance optimization technique.
+
+在现代 NVIDIA GPU 上，异步的全局内存到共享内存拷贝允许多个处于飞行中的预取阶段同时进行，从而把内存传输与计算重叠。这使得双缓冲（以及三缓冲等）成为一种有价值且重要的性能优化技术。
+
+Triton implements pipelining through a num_stages meta-parameter used by Triton loop iterators. This parameter is passed to the tl.range() loop iterators. When you pass num_stages>1, the iterators automatically pipeline the loop by issuing asynchronous copy operations for up to num_stages iterations in flight.
+
+Triton 通过 Triton 循环迭代器所使用的 num_stages 元参数来实现流水线。该参数会传递给 tl.range() 循环迭代器。当你传入 num_stages>1 时，迭代器会自动对循环进行流水线化，为多达 num_stages 次迭代发出处于飞行中的异步拷贝操作。
+
+This will overlap memory loads with computations across those staged iterations. This process continues until all tiles are processed. Here is an implementation of tile-based double buffering (num_stages=2) in Triton:
+
+这会在这些分阶段的迭代之间把内存加载与计算重叠。该过程会持续进行，直到所有分块都处理完毕。下面是一个在 Triton 中实现基于分块的双缓冲（num_stages=2）的实现：
+
+```
+@triton.jit
+def pipelined_matmul(
+    A_ptr, B_ptr, C_ptr,
+    M, N, K,
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    # compile-time constants:
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    NUM_STAGES: tl.constexpr,
+):
+    # Program (CTA) ids for the MxN tiling
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    m0 = pid_m * BLOCK_M
+    n0 = pid_n * BLOCK_N
+    offs_m = m0 + tl.arange(0, BLOCK_M)
+    offs_n = n0 + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+    # ---------------- Descriptor creation (maps to TMA on Blackwell) ----------
+    # Requirements for descriptor/TMA on NVIDIA GPUs:
+    #  - leading strides are multiples of 16 BYTES
+    #  - last dimension contiguous
+    #  - block_shape matches the tile you intend to move
+    A_desc = tl.make_tensor_descriptor(
+        A_ptr,
+        shape=[M, K],
+        strides=[stride_am, stride_ak],
+        block_shape=[BLOCK_M, BLOCK_K],
+    )
+    B_desc = tl.make_tensor_descriptor(
+        B_ptr,
+        shape=[K, N],
+        strides=[stride_bk, stride_bn],
+        block_shape=[BLOCK_K, BLOCK_N],
+    )
+    # Accumulator in FP32; on Blackwell this resides in TMEM, not registers.
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    # Number of K tiles
+    K_tiles = (K + BLOCK_K - 1) // BLOCK_K
+    if K_tiles == 0:
+        # Nothing to do, store zeros (masked)
+        c_ptrs = C_ptr + (offs_m[:, None]
+                          * stride_cm + offs_n[None, :] * stride_cn)
+        c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+        tl.store(c_ptrs, acc, mask=c_mask)
+        return
+    # --------- Prefetch the first "current" tiles (fast path if fully in-bounds)
+    k0 = 0
+    if (m0 + BLOCK_M <= M) and (k0 + BLOCK_K <= K):
+        a_cur = A_desc.load([m0, k0])
+    else:
+        # Boundary: compute row/col offsets and use boundary-checked load
+        row_offsets = offs_m[:, None] + tl.zeros((BLOCK_M, BLOCK_K),
+                                                  dtype=offs_m.dtype)
+        col_offsets = (k0 + offs_k)[None, :] + tl.zeros((BLOCK_M, BLOCK_K),
+                                                         dtype=offs_k.dtype)
+        a_cur = tl.load(A_desc, offsets=(row_offsets, col_offsets),
+                        boundary_check=(0, 1), padding_option="zero")
+    if (n0 + BLOCK_N <= N) and (k0 + BLOCK_K <= K):
+        b_cur = B_desc.load([k0, n0])
+    else:
+        row_offsets = (k0 + offs_k)[:, None] + tl.zeros((BLOCK_K, BLOCK_N),
+                                                         dtype=offs_k.dtype)
+        col_offsets = offs_n[None, :] + tl.zeros((BLOCK_K, BLOCK_N),
+                                                  dtype=offs_n.dtype)
+        b_cur = tl.load(B_desc, offsets=(row_offsets, col_offsets),
+                        boundary_check=(0, 1), padding_option="zero")
+    # ------------- K loop with software pipelining and TMA prefetch -----------
+    # Put prefetch as early as possible in loop body; keep separate "current"
+    # tile so loads for the next iteration can overlap with the dot-product of
+    # current tile. Use warp_specialize to partition producer/consumer warps.
+    for kt in tl.range(0, K_tiles, num_stages=NUM_STAGES, warp_specialize=True):
+        next_k = (kt + 1) * BLOCK_K
+        # Prefetch NEXT tiles early (TMA), if there is a next tile
+        if kt + 1 < K_tiles:
+            if (m0 + BLOCK_M <= M) and (next_k + BLOCK_K <= K):
+                a_next = A_desc.load([m0, next_k])
+            else:
+                row_offsets = offs_m[:, None] + tl.zeros((BLOCK_M, BLOCK_K),
+                                                          dtype=offs_m.dtype)
+                col_offsets = (next_k + offs_k)[None, :]
+                              + tl.zeros((BLOCK_M, BLOCK_K), dtype=offs_k.dtype)
+                a_next = tl.load(A_desc, offsets=(row_offsets, col_offsets),
+                                 boundary_check=(0, 1), padding_option="zero")
+            if (n0 + BLOCK_N <= N) and (next_k + BLOCK_K <= K):
+                b_next = B_desc.load([next_k, n0])
+            else:
+                row_offsets = (next_k + offs_k)[:, None]
+                               + tl.zeros((BLOCK_K, BLOCK_N), dtype=offs_k.dtype)
+                col_offsets = offs_n[None, :] + tl.zeros((BLOCK_K, BLOCK_N),
+                                                          dtype=offs_n.dtype)
+                b_next = tl.load(B_desc, offsets=(row_offsets, col_offsets),
+                                 boundary_check=(0, 1), padding_option="zero")
+        # Compute on the CURRENT tiles (UMMA; accumulators in TMEM on Blackwell)
+        acc += tl.dot(a_cur, b_cur)
+        # Swap in prefetched NEXT tiles
+        if kt + 1 < K_tiles:
+            a_cur = a_next
+            b_cur = b_next
+    # ------------------------------- Store C ----------------------------------
+    c_ptrs = C_ptr + (offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn)
+    c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(c_ptrs, acc, mask=c_mask)
+```
+
+```
+@triton.jit
+def pipelined_matmul(
+    A_ptr, B_ptr, C_ptr,
+    M, N, K,
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    # compile-time constants:
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    NUM_STAGES: tl.constexpr,
+):
+    # Program (CTA) ids for the MxN tiling
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    m0 = pid_m * BLOCK_M
+    n0 = pid_n * BLOCK_N
+    offs_m = m0 + tl.arange(0, BLOCK_M)
+    offs_n = n0 + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+    # ---------------- Descriptor creation (maps to TMA on Blackwell) ----------
+    # Requirements for descriptor/TMA on NVIDIA GPUs:
+    #  - leading strides are multiples of 16 BYTES
+    #  - last dimension contiguous
+    #  - block_shape matches the tile you intend to move
+    A_desc = tl.make_tensor_descriptor(
+        A_ptr,
+        shape=[M, K],
+        strides=[stride_am, stride_ak],
+        block_shape=[BLOCK_M, BLOCK_K],
+    )
+    B_desc = tl.make_tensor_descriptor(
+        B_ptr,
+        shape=[K, N],
+        strides=[stride_bk, stride_bn],
+        block_shape=[BLOCK_K, BLOCK_N],
+    )
+    # Accumulator in FP32; on Blackwell this resides in TMEM, not registers.
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    # Number of K tiles
+    K_tiles = (K + BLOCK_K - 1) // BLOCK_K
+    if K_tiles == 0:
+        # Nothing to do, store zeros (masked)
+        c_ptrs = C_ptr + (offs_m[:, None]
+                          * stride_cm + offs_n[None, :] * stride_cn)
+        c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+        tl.store(c_ptrs, acc, mask=c_mask)
+        return
+    # --------- Prefetch the first "current" tiles (fast path if fully in-bounds)
+    k0 = 0
+    if (m0 + BLOCK_M <= M) and (k0 + BLOCK_K <= K):
+        a_cur = A_desc.load([m0, k0])
+    else:
+        # Boundary: compute row/col offsets and use boundary-checked load
+        row_offsets = offs_m[:, None] + tl.zeros((BLOCK_M, BLOCK_K),
+                                                  dtype=offs_m.dtype)
+        col_offsets = (k0 + offs_k)[None, :] + tl.zeros((BLOCK_M, BLOCK_K),
+                                                         dtype=offs_k.dtype)
+        a_cur = tl.load(A_desc, offsets=(row_offsets, col_offsets),
+                        boundary_check=(0, 1), padding_option="zero")
+    if (n0 + BLOCK_N <= N) and (k0 + BLOCK_K <= K):
+        b_cur = B_desc.load([k0, n0])
+    else:
+        row_offsets = (k0 + offs_k)[:, None] + tl.zeros((BLOCK_K, BLOCK_N),
+                                                         dtype=offs_k.dtype)
+        col_offsets = offs_n[None, :] + tl.zeros((BLOCK_K, BLOCK_N),
+                                                  dtype=offs_n.dtype)
+        b_cur = tl.load(B_desc, offsets=(row_offsets, col_offsets),
+                        boundary_check=(0, 1), padding_option="zero")
+    # ------------- K loop with software pipelining and TMA prefetch -----------
+    # Put prefetch as early as possible in loop body; keep separate "current"
+    # tile so loads for the next iteration can overlap with the dot-product of
+    # current tile. Use warp_specialize to partition producer/consumer warps.
+    for kt in tl.range(0, K_tiles, num_stages=NUM_STAGES, warp_specialize=True):
+        next_k = (kt + 1) * BLOCK_K
+        # Prefetch NEXT tiles early (TMA), if there is a next tile
+        if kt + 1 < K_tiles:
+            if (m0 + BLOCK_M <= M) and (next_k + BLOCK_K <= K):
+                a_next = A_desc.load([m0, next_k])
+            else:
+                row_offsets = offs_m[:, None] + tl.zeros((BLOCK_M, BLOCK_K),
+                                                          dtype=offs_m.dtype)
+                col_offsets = (next_k + offs_k)[None, :]
+                              + tl.zeros((BLOCK_M, BLOCK_K), dtype=offs_k.dtype)
+                a_next = tl.load(A_desc, offsets=(row_offsets, col_offsets),
+                                 boundary_check=(0, 1), padding_option="zero")
+            if (n0 + BLOCK_N <= N) and (next_k + BLOCK_K <= K):
+                b_next = B_desc.load([next_k, n0])
+            else:
+                row_offsets = (next_k + offs_k)[:, None]
+                               + tl.zeros((BLOCK_K, BLOCK_N), dtype=offs_k.dtype)
+                col_offsets = offs_n[None, :] + tl.zeros((BLOCK_K, BLOCK_N),
+                                                          dtype=offs_n.dtype)
+                b_next = tl.load(B_desc, offsets=(row_offsets, col_offsets),
+                                 boundary_check=(0, 1), padding_option="zero")
+        # Compute on the CURRENT tiles (UMMA; accumulators in TMEM on Blackwell)
+        acc += tl.dot(a_cur, b_cur)
+        # Swap in prefetched NEXT tiles
+        if kt + 1 < K_tiles:
+            a_cur = a_next
+            b_cur = b_next
+    # ------------------------------- Store C ----------------------------------
+    c_ptrs = C_ptr + (offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn)
+    c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(c_ptrs, acc, mask=c_mask)
+```
+
+Triton’s compiler sees num_stages, generates asynchronous loads/stores with TMA and TMEM using Triton tensor descriptors, and automatically manages the synchronization. The use of TMA tensor descriptors and TMEM reduces register pressure and simplifies expressing multidimensional transfers. The preceding loop performs prefetch-next → compute-current → swap. This preserves overlap with num_stages>1 and avoids silent overlap collapse when you overwrite the current tile too early. Specifically, while one tile is being loaded into shared memory, the previous tile’s computation is being performed.
+
+Triton 的编译器会识别 num_stages，利用 Triton 张量描述符（tensor descriptor）借助 TMA 和 TMEM 生成异步加载/存储，并自动管理同步。使用 TMA 张量描述符和 TMEM 可以降低寄存器压力，并简化对多维传输的表达。前面的循环执行的是「预取下一个 → 计算当前 → 交换」。这在 num_stages>1 时保持了重叠，并避免了因过早覆盖当前分块而导致重叠悄然失效。具体来说，当一个分块正被加载进共享内存时，上一个分块的计算正在进行。
+
+You can also use warp specialization, in which Triton partitions producer and consumer warps to overlap global-to-shared copies with compute. This is automatically enabled when heuristics select it.
+
+你还可以使用 warp 专门化，Triton 会借此划分生产者 warp 与消费者 warp，从而把全局内存到共享内存的拷贝与计算重叠起来。当启发式规则选择使用它时，这一功能会自动启用。
+
+It’s important to keep the pipeline’s overlap intact. When you set num_stages > 1, make sure the tile you are currently computing stays live across loop iterations. You don’t want to overwrite or drop its reference until the math that consumes it is finished.
+
+保持流水线的重叠不被破坏很重要。当你设置 num_stages > 1 时，要确保当前正在计算的分块在整个循环迭代期间保持存活。在消费它的运算完成之前，你不应覆盖或丢弃对它的引用。
+
+Consider a 2-stage ring buffer in which you compute the current buffer while asynchronously fetching the next buffer. You then swap the current and next buffers. In this scenario, you need to wait and consume the “current” buffer before releasing it. At the same time, you need to use commit/wait to guard the “next” buffer (tile) until the swap.
+
+考虑一个两阶段的环形缓冲区（ring buffer）：你在计算当前缓冲区的同时，异步获取下一个缓冲区。随后你交换当前缓冲区与下一个缓冲区。在这种情形下，你需要先等待并消费「当前」缓冲区，然后才能释放它。与此同时，你需要用提交/等待（commit/wait）来守护「下一个」缓冲区（分块），直到发生交换。
+
+If the current tile doesn’t survive across iterations (e.g., you overwrite its buffer or let the reference die), the compiler is free to reorder, sink, or hoist the “next” iteration’s copies past the “current” uses. This will cause your load/compute overlap to quietly disappear.
+
+如果当前分块无法跨迭代存活（例如你覆盖了它的缓冲区，或让其引用失效），编译器就可以自由地把「下一次」迭代的拷贝重排、下沉或提升到「当前」使用之前。这会让你的加载/计算重叠悄然消失。
+
+And If you manage shared-memory block pointers/TMA yourself, make sure to use the explicit handshake: enqueue async copies → tl.commit() → (later) tl.wait() → consume the tile → advance pointers. If you call tl.wait() right before you read the tile—and only release/swap after consumption—you will preserve true overlap.
+
+而如果你自己管理共享内存块指针/TMA，务必使用显式握手：把异步拷贝入队 → tl.commit() →（稍后）tl.wait() → 消费该分块 → 推进指针。如果你在读取分块之前才调用 tl.wait()，并且只在消费之后才释放/交换，你就能保持真正的重叠。
+
+> On modern GPUs, Triton backs descriptor loads and stores with the Tensor Memory Accelerator (TMA). When you pipeline a loop (num_stages > 1), prefetch the next tile early and keep a separate variable for the current tile. Don’t overwrite or drop the “current” reference until the operation that consumes it is finished. Otherwise, the compiler may legally reorder the next iteration’s copies past current uses and your overlap will collapse. The simplest pattern is prefetch-next → compute-current → swap.
+
+> 在现代 GPU 上，Triton 用张量内存加速器（Tensor Memory Accelerator，TMA）来支撑描述符的加载与存储。当你对循环进行流水线化（num_stages > 1）时，要尽早预取下一个分块，并为当前分块保留一个单独的变量。在消费它的操作完成之前，不要覆盖或丢弃「当前」引用。否则，编译器可能合法地把下一次迭代的拷贝重排到当前使用之前，你的重叠就会崩溃。最简单的模式是「预取下一个 → 计算当前 → 交换」。
+
+In short, software pipelining improves memory bandwidth utilization and hides latency. And if memory bandwidth isn’t the bottleneck, you can increase num_stages to 3 (e.g., triple buffering) to prefetch two tiles in flight and further improve performance at the cost of more shared memory usage for the additional buffers. However, on hardware with tighter shared-memory budgets—or for compute-heavy kernels—the extra stages might lead to a diminishing return, lower occupancy, and reduced overall performance.
+
+简而言之，软件流水线能改善内存带宽利用率并隐藏延迟。而如果内存带宽不是瓶颈，你可以把 num_stages 增大到 3（例如三缓冲），从而预取两个处于飞行中的分块，以进一步提升性能，代价是为额外的缓冲区占用更多共享内存。然而，在共享内存预算更紧张的硬件上——或者对于计算密集型核函数——额外的阶段可能带来收益递减、更低的占用率以及更差的整体性能。
+
+### Profiling with Triton Proton Profiler
+
+### 使用 Triton Proton 剖析器进行剖析
+
+To deeply profile Triton kernel performance, use Triton’s Proton profiler. This is a separate profiling package that integrates with Triton and emits NVTX ranges visible in Nsight Systems timelines. These NVTX ranges instrument code regions, collect timings, and track key metrics. The NVTX markers then appear in Nsight Systems timelines. Use these NVTX regions to jump from Proton summaries into Nsight Compute for more focused kernel-level analysis.
+
+要深入剖析 Triton 核函数的性能，请使用 Triton 的 Proton 剖析器。这是一个独立的剖析软件包，与 Triton 集成，并发出可在 Nsight Systems 时间线中看到的 NVTX 区间。这些 NVTX 区间会对代码区域进行插桩、收集计时并跟踪关键指标。随后这些 NVTX 标记会出现在 Nsight Systems 的时间线中。利用这些 NVTX 区间，你可以从 Proton 的汇总结果跳转到 Nsight Compute，进行更聚焦的核函数级分析。
+
+In practice, you wrap critical sections of Triton code using the with proton.scope("name", metadata) Python context manager. Before running the workload, you activate the profiler with proton.start("matmul", hook="triton").
+
+在实践中，你使用 with proton.scope("name", metadata) 这个 Python 上下文管理器来包裹 Triton 代码的关键区段。在运行工作负载之前，你用 proton.start("matmul", hook="triton") 激活剖析器。
+
+metadata in Proton is any user-provided dictionary of annotations or metrics, such as total FLOPS, memory byte counts, thread block indices, warp-level indices, or the number of recorded slots. These get recorded alongside timing data for richer performance analysis.
+
+Proton 中的 metadata 是任意由用户提供的注解或指标字典，例如总 FLOPS、内存字节数、线程块索引、warp 级索引，或记录的槽位数量。这些会与计时数据一起被记录下来，以支持更丰富的性能分析。
+
+After execution, you finalize and fetch the profiling data. The output can be printed as a hierarchical table of timings. Here is an excerpt of a Proton profiling result that compares different matmul kernels for multiplying 8,192 × 8,192 matrices:
+
+执行结束后，你完成收尾并取回剖析数据。输出可以打印为一张分层的计时表格。下面是一段 Proton 剖析结果的摘录，它比较了用于相乘 8,192 × 8,192 矩阵的不同 matmul 核函数：
+
+```
+168.314 ms    16331.291  ROOT
+├─ 174.920 ms   3928.623  cublas [M=8192,N=8192,K=512]
+├─ 165.349 ms   4156.033  matmul_kernel [M=8192,N=8192,K=512]
+├─ 159.352 ms   4312.421  matmul_kernel_persistent [M=8192,N=8192,K=512]
+└─ 174.671 ms   3934.214  torch [M=8192,N=8192,K=512]
+```
+
+```
+168.314 ms    16331.291  ROOT
+├─ 174.920 ms   3928.623  cublas [M=8192,N=8192,K=512]
+├─ 165.349 ms   4156.033  matmul_kernel [M=8192,N=8192,K=512]
+├─ 159.352 ms   4312.421  matmul_kernel_persistent [M=8192,N=8192,K=512]
+└─ 174.671 ms   3934.214  torch [M=8192,N=8192,K=512]
+```
+
+> In the preceding profiling output, the label K denotes the reduction dimension, or the shared inner size of the matrix multiply (e.g., an M × K matrix multiplied by a K × N matrix). This represents the length of the dot product that drives both compute cost and memory traffic.
+
+> 在前面的剖析输出中，标签 K 表示归约维度，即矩阵乘法共享的内部尺寸（例如一个 M × K 矩阵乘以一个 K × N 矩阵）。它代表点积的长度，而点积同时驱动着计算成本与内存流量。
+
+In this profile report, we see the Triton persistent kernel outperforms cuBLAS, 159.352 ms versus 174.920 ms. Proton makes it easy to quantify such differences. It also computes derived metrics like effective TFLOPS and memory bandwidth. If you supply additional metadata such as the total FLOPS count, Proton will show you if you’re nearing the theoretical hardware TFLOPS limit for the precision you are using (e.g., BF16/FP16, FP8, FP4, etc.). For many matrix shapes and precisions, cuBLASLt or CUTLASS paths in PyTorch will match or exceed a custom Triton kernel.
+
+在这份剖析报告中，我们看到 Triton 持久化核函数胜过了 cuBLAS，159.352 ms 对 174.920 ms。Proton 使得量化这类差异变得容易。它还会计算派生指标，例如有效 TFLOPS 和内存带宽。如果你提供了额外的 metadata（例如总 FLOPS 计数），Proton 会告诉你是否正接近你所用精度（例如 BF16/FP16、FP8、FP4 等）的理论硬件 TFLOPS 上限。对于许多矩阵形状和精度，PyTorch 中的 cuBLASLt 或 CUTLASS 路径都会追平甚至超过自定义 Triton 核函数。
+
+NVIDIA’s Nsight Systems and Nsight Compute tools support Triton kernels as well. For instance, Nsight Systems shows kernel-launch names and any NVTX ranges emitted by PyTorch or Proton. These can be used to correlate Proton scopes with Nsight timelines. This way, you can use Proton’s output to pinpoint interesting kernels in Nsight Systems and then dive deeper into Nsight Compute for low-level analysis. You would use Nsight Compute to analyze register usage, achieved occupancy, etc. Using these tools together provides a more complete system performance analysis.
+
+NVIDIA 的 Nsight Systems 和 Nsight Compute 工具同样支持 Triton 核函数。例如，Nsight Systems 会显示核函数启动的名称，以及由 PyTorch 或 Proton 发出的任何 NVTX 区间。这些可用于把 Proton 作用域与 Nsight 时间线关联起来。这样，你就可以用 Proton 的输出在 Nsight Systems 中定位有意思的核函数，然后深入到 Nsight Compute 中进行底层分析。你会用 Nsight Compute 来分析寄存器使用、实际占用率等。将这些工具配合使用，能提供更完整的系统性能分析。
+
+## PyTorch XLA Backend
+
+## PyTorch XLA 后端
+
+While TorchInductor is the PyTorch default backend for GPUs and CPUs, PyTorch XLA is a separate backend-compilation option that targets Google Cloud TPUs and other accelerators. PyTorch XLA allows PyTorch models to run on these accelerators by mapping PyTorch operations into XLA’s graph IR and executing them using the target hardware’s runtime, as shown in Figure 14-6.
+
+虽然 TorchInductor 是 PyTorch 面向 GPU 和 CPU 的默认后端，但 PyTorch XLA 是一个独立的后端编译选项，面向 Google Cloud TPU 及其他加速器。PyTorch XLA 通过把 PyTorch 运算映射为 XLA 的图 IR，并使用目标硬件的运行时来执行它们，从而让 PyTorch 模型能够在这些加速器上运行，如图 14-6 所示。
+
+![Figure 14-6. OpenXLA, the basis of the PyTorch XLA compiler backend](AI%20Systems%20Performance%20Engineering-ch14_images/figure-14-6.png)
+
+![图 14-6. OpenXLA，即 PyTorch XLA 编译器后端的基础](AI%20Systems%20Performance%20Engineering-ch14_images/figure-14-6.png)
+
+To activate the XLA backend, you can use torch.compile(..., backend="openxla"), which activates PyTorch XLA based on OpenXLA. This backend string is supported by the PyTorch XLA project and activates OpenXLA-based compilation. Similar to TorchDynamo and TorchInductor, XLA captures the graph of computations. However, it compiles whole programs ahead of time because XLA is designed to generate static graphs.
+
+要激活 XLA 后端，你可以使用 torch.compile(..., backend="openxla")，它会激活基于 OpenXLA 的 PyTorch XLA。这个后端字符串由 PyTorch XLA 项目支持，会启用基于 OpenXLA 的编译。与 TorchDynamo 和 TorchInductor 类似，XLA 会捕获计算图。不过，它会提前编译整个程序，因为 XLA 的设计目标是生成静态图。
+
+XLA is optimized for static shapes or bounded dynamic shapes. As such, when using XLA, dynamic shape support is a bit more limited. New shapes trigger whole-program recompilation, which is expensive for latency-sensitive inference. However, OpenXLA caches executables per shape signature, which can improve performance.
+
+XLA 针对静态形状或有界的动态形状进行了优化。因此，使用 XLA 时，对动态形状的支持会更受限一些。新形状会触发整个程序的重新编译，这对延迟敏感的推理来说代价高昂。不过，OpenXLA 会按形状签名缓存可执行文件，这可以改善性能。
+
+> You may need to pad or use fixed-size buckets for your inputs. This is because XLA will recompile for new shapes rather than handling them symbolically.
+
+> 你可能需要对输入进行填充，或使用固定大小的分桶。这是因为 XLA 会针对新形状重新编译，而不是以符号化方式处理它们。
+
+The XLA compiler will cache each compiled graph per unique input shape and signature. As such, performance will improve after a few warm-up steps similar to TorchInductor. The major difference is that XLA will not incrementally compile mid-run. The graph is built statically ahead of time. And if a new shape is encountered, it will trigger a new whole-graph compilation, which is very expensive and impacts latency-sensitive workloads like inference.
+
+XLA 编译器会为每个唯一的输入形状和签名缓存对应的已编译图。因此，与 TorchInductor 类似，经过几个预热步骤之后性能会有所提升。主要的区别在于，XLA 不会在运行过程中增量编译。图是提前静态构建的。如果遇到新的形状，就会触发一次全新的整图编译，这非常昂贵，并会影响像推理这类延迟敏感的工作负载。
+
+In short, if you’re running on a hardware device not currently supported by the TorchInductor backend, you can potentially use the XLA backend if the device supports XLA. Many of the same principles apply, such as minimizing graph breaks. You can also use some distributed strategies with XLA, such as data and model parallelism. While XLA isn’t commonly used with NVIDIA GPUs, it’s a powerful backend for non-NVIDIA hardware (e.g., Google TPUs using OpenXLA or other accelerators that support XLA IR). XLA benefits from many similar compilation techniques discussed in this chapter.
+
+简而言之，如果你运行在 TorchInductor 后端目前尚不支持的硬件设备上，只要该设备支持 XLA，你就有可能使用 XLA 后端。许多相同的原则依然适用，例如尽量减少图中断。你也可以在 XLA 上使用一些分布式策略，例如数据并行和模型并行。虽然 XLA 在 NVIDIA GPU 上并不常用，但对于非 NVIDIA 硬件（例如使用 OpenXLA 的 Google TPU，或其他支持 XLA IR 的加速器）而言，它是一个强大的后端。XLA 得益于本章讨论过的许多类似编译技术。
+
+## Key Takeaways
+
+## 关键要点
+
+We covered quite a lot in this chapter, and we dove super deep into the PyTorch compiler stack and OpenAI’s Triton language and compiler. The following are some key takeaways:
+
+本章我们覆盖了相当多的内容，并且超级深入地剖析了 PyTorch 编译器栈以及 OpenAI 的 Triton 语言与编译器。以下是一些关键要点：
+
+*Leverage* torch.compile *for easy speedups* Choose the compilation mode based on your needs (e.g., "default" for quicker startup, "max-autotune" for maximum performance). Always perform a few warm-up iterations to get past the initial compile. For short-running jobs or small models, the compile overhead might outweigh the speedup, so use it when you have enough work to amortize the one-time cost.
+
+*善用* torch.compile *实现轻松加速* 根据你的需求选择编译模式（例如用 "default" 换取更快的启动，用 "max-autotune" 换取最高性能）。始终执行几次预热迭代，以越过初次编译。对于运行时间很短的作业或小模型，编译开销可能超过所获得的加速，因此只有当你有足够多的工作量来摊薄这一次性成本时才使用它。
+
+*Set performance flags early* Following are the flags you should enable for fast FP32 matmuls and SDPA variants including Flash Attention. Always validate accuracy for your model and keep these enabled for the best performance:
+
+*尽早设置性能标志* 下面这些标志用于启用快速的 FP32 矩阵乘以及包括 Flash Attention 在内的 SDPA 变体。始终为你的模型验证精度，并保持启用这些标志以获得最佳性能：
+
+```
+import torch
+ # maps to TF32/BF16 fast paths
+torch.set_float32_matmul_precision("high")
+torch.backends.cuda.matmul.allow_tf32 = True
+# affects convs
+torch.backends.cudnn.allow_tf32 = True
+torch.backends.cuda.enable_flash_sdp(True)
+torch.backends.cuda.enable_mem_efficient_sdp(True)
+```
+
+```
+import torch
+ # maps to TF32/BF16 fast paths
+torch.set_float32_matmul_precision("high")
+torch.backends.cuda.matmul.allow_tf32 = True
+# affects convs
+torch.backends.cudnn.allow_tf32 = True
+torch.backends.cuda.enable_flash_sdp(True)
+torch.backends.cuda.enable_mem_efficient_sdp(True)
+```
+
+*Minimize graph breaks* Inspect graph breaks using torch._dynamo.explain or TORCH_LOGS= "graph_breaks". Remove or refactor code that causes breaks (e.g., prints, data-dependent Python control flow, unsupported ops) to maximize the contiguous regions that can be compiled. Fewer, larger graphs generally mean better performance. If needed, use the new torch.cond API for conditional logic or move noncritical Python-side processing out of the model’s forward function. The goal is to present the compiler a long, purely tensor-in and tensor-out code path.
+
+*尽量减少图中断* 使用 torch._dynamo.explain 或 TORCH_LOGS="graph_breaks" 检查图中断。移除或重构会引发中断的代码（例如打印、依赖数据的 Python 控制流、不受支持的算子），以最大化可被编译的连续区域。更少、更大的图通常意味着更好的性能。如有需要，可使用新的 torch.cond API 来处理条件逻辑，或把非关键的 Python 侧处理移出模型的 forward 函数。目标是给编译器呈现一条长而纯粹的、张量进、张量出的代码路径。
+
+*Use dynamic shapes carefully* While not necessary, setting torch.compile(dynamic=True) upfront forces the compiler to consider all dimensions as dynamic. This way, one compiled model can handle a wide range of input shapes—reducing the need for padding. The compiler will do this dynamically, but setting dynamic=True forces the compiler to do this upfront. You can also mark only specific dimensions dynamic with mark_dynamic() instead of all dimensions. This way, you localize the flexibility to where it’s actually needed. This is great for variable sequence lengths, but make sure to measure the trade-offs. Enabling dynamic-shape support can disable CUDA Graphs and insert additional guards. If your shapes don’t vary too widely, a hybrid approach can work best. Specifically, you can bucket inputs by size—up to limit the number of distinct shapes and then enable dynamic shapes for the remaining variability. This hybrid approach avoids excessive recompilations while still reducing padding waste.
+
+*谨慎使用动态形状* 虽然并非必需，但预先设置 torch.compile(dynamic=True) 会强制编译器把所有维度都视为动态。这样，一个已编译的模型就能处理很宽范围的输入形状——从而减少对填充的需求。编译器本来会动态地做这件事，但设置 dynamic=True 会强制它提前完成。你也可以用 mark_dynamic() 只把特定维度标记为动态，而不是标记所有维度。这样，你就把这种灵活性局限在真正需要的地方。这对于可变序列长度非常有用，但务必衡量其中的权衡。启用动态形状支持可能会禁用 CUDA Graphs 并插入额外的保护条件。如果你的形状变化不太大，混合方法可能效果最好。具体来说，你可以按大小对输入进行分桶——从而限制不同形状的数量，然后对剩余的可变性启用动态形状。这种混合方法既避免了过度的重新编译，又减少了填充带来的浪费。
+
+*Profile for recompilation guards* Use TORCH_LOGS="graph_breaks,guards,recompiles" to find which guard is triggering if you see multiple compilations. Common culprits are Python random values, changing tensor ranks, or varying device/dtype. Make those aspects static or mark them as safe with allow_in_graph if appropriate.
+
+*剖析重新编译的保护条件* 如果你看到多次编译，使用 TORCH_LOGS="graph_breaks,guards,recompiles" 来查明是哪个保护条件被触发。常见的元凶是 Python 随机值、变化的张量秩，或不同的设备/dtype。把这些方面变成静态，或在合适的情况下用 allow_in_graph 把它们标记为安全。
+
+*Avoid recompilations if possible* In a well-tuned training loop, you should see zero recompilations after the initial few iterations. If you do see continued recompiling, investigate immediately, as it usually means something is changing on every iteration. This includes debug print statements with an incrementing counter, etc. Use the set_stance() API and guard-logging to catch these. Also make sure that you’re not unintentionally mixing devices by sending a CPU tensor on one iteration and then a GPU on the next. This will trigger a recompile.
+
+*尽量避免重新编译* 在一个调优良好的训练循环中，初始的几次迭代之后你应当看到零次重新编译。如果确实看到持续的重新编译，请立即排查，因为这通常意味着某些东西在每次迭代时都在变化。这包括带有递增计数器的调试打印语句等。使用 set_stance() API 和保护条件日志来捕捉这些问题。同时确保你不会无意中混用设备——在某次迭代发送一个 CPU 张量，在下一次迭代又发送一个 GPU 张量。这会触发一次重新编译。
+
+*Tune and monitor memory usage* Compiled mode might use more memory for larger fused kernels and guard buffers. Monitor GPU memory. If you hit memory issues, consider using a smaller BLOCK_SIZE in Triton kernels or disabling certain fusions. Also ensure you free any large intermediate results promptly, as they might hang around longer in a compiled graph’s lifecycle. If you see out-of-memory errors during compilation, you might need to split your model or use lower max_autotune settings. PyTorch supports automatic checkpointing for large graphs to reduce memory pressure, but it’s not foolproof. You can also try compiling submodules (e.g., each layer or block) separately instead of compiling the entire model at once to limit memory usage during kernel generation.
+
+*调优并监控内存使用* 编译模式可能会为更大的融合核函数和保护条件缓冲区使用更多内存。请监控 GPU 内存。如果遇到内存问题，可以考虑在 Triton 核函数中使用更小的 BLOCK_SIZE，或禁用某些融合。也要确保及时释放任何大的中间结果，因为在编译图的生命周期中它们可能停留得更久。如果你在编译期间看到内存不足错误，可能需要拆分模型，或使用更低的 max_autotune 设置。PyTorch 支持对大图进行自动检查点以减轻内存压力，但这并非万无一失。你也可以尝试分别编译子模块（例如每一层或每个块），而不是一次性编译整个模型，以此限制核函数生成期间的内存使用。
+
+*Combine the PyTorch compiler with distributed training wisely* When using DDP or FSDP, be aware of intentional graph breaks at communication points. They are expected and optimized by overlapping communication with computation. Wrap submodules in FSDP to get shard-wise compilation and memory savings. Keep an eye on any all-reduce-related warnings in dynamo.explain. PyTorch’s design tries to minimize performance degradation due to graph breaks. When using FSDP with torch.compile, you may see graph breaks for gradient prereduction and postreduction steps. These are expected and handled. Focus on the main forward and backward passes within each shard being compiled.
+
+*明智地将 PyTorch 编译器与分布式训练结合* 使用 DDP 或 FSDP 时，要注意在通信点处存在有意为之的图中断。它们是预期之内的，并会通过把通信与计算重叠来加以优化。把子模块包裹进 FSDP，以获得分片级的编译和内存节省。留意 dynamo.explain 中任何与 all-reduce 相关的警告。PyTorch 的设计力图把图中断带来的性能下降降到最低。当把 FSDP 与 torch.compile 一起使用时，你可能会在梯度预归约和后归约步骤处看到图中断。这些是预期之内并会被妥善处理的。请专注于每个被编译分片内部的主要前向和反向传播。
+
+*Use* TORCH_LOGS="perf_hints" *to catch missed optimizations* This will tell you, for example, if CUDA Graphs weren’t used due to input mutation—or if an operation fell back to eager mode. These hints can guide you to potential improvements by telling you to avoid certain patterns or wait for future support. Often, a hint will directly suggest the workaround. For instance, the “input is mutated” hint implies that you should avoid in-place operations on the input before compiling.
+
+*使用* TORCH_LOGS="perf_hints" *捕捉错失的优化* 举例来说，它会告诉你 CUDA Graphs 是否因为输入被改写而未被使用——或者某个运算是否回退到了即时执行模式。这些提示可以引导你发现潜在的改进，办法是告诉你避免某些模式或等待未来的支持。提示往往会直接建议解决办法。例如，「input is mutated」提示意味着你应该避免在编译之前对输入执行原地操作。
+
+*Debug with small inputs first* When developing custom kernels or testing compiled mode, use small tensor sizes to quickly catch correctness issues. Once it’s working, scale up. Use PyTorch’s torch._dynamo.config.verbose or even TORCH_LOGS="output_code" to inspect generated code for small cases. Be aware that performance measured on tiny inputs may not reflect behavior on real sizes. But, for debugging correctness and seeing what kernels are generated, this is a useful technique.
+
+*先用小输入调试* 在开发自定义核函数或测试编译模式时，使用较小的张量尺寸来快速捕捉正确性问题。一旦它能正常工作，再扩大规模。使用 PyTorch 的 torch._dynamo.config.verbose，甚至 TORCH_LOGS="output_code"，来检查小规模用例所生成的代码。请注意，在极小输入上测得的性能可能无法反映真实尺寸下的行为。但对于调试正确性以及查看生成了哪些核函数，这是一种有用的技术。
+
+*Write custom kernels only for the true bottlenecks* Before embarking on Triton kernel development, profile your model with and without compiling to identify hotspots. Often, TorchInductor already fuses many things. Focus your efforts on areas where Inductor falls short—maybe a custom op or an atypical fusion. Do not prematurely optimize everything. Use the compiler for most—and hand-tune the rest. For example, if TorchInductor fails to fuse a particular sequence of operations that is performance-critical, such as a multistep custom activation, this might justify a separate Triton kernel. Just weigh the maintenance cost since each custom kernel is code, and you may need to update this code when you change hardware—or if PyTorch eventually adds native support. Often, filing an issue or feature request for TorchInductor to support a pattern is worthwhile if it benefits many other users.
+
+*只为真正的瓶颈编写自定义核函数* 在着手开发 Triton 核函数之前，先分别在编译和不编译的情况下剖析你的模型，以识别热点。通常，TorchInductor 已经融合了很多东西。把精力集中在 Inductor 力有不逮的地方——也许是某个自定义算子或一种非典型的融合。不要过早地优化一切。用编译器处理大部分——其余的手工调优。举例来说，如果 TorchInductor 未能融合某个对性能至关重要的特定运算序列（比如一个多步的自定义激活），这或许就足以证明单独编写一个 Triton 核函数的合理性。只要权衡好维护成本即可，因为每个自定义核函数都是代码，当你更换硬件时——或者当 PyTorch 最终加入原生支持时——你可能都需要更新这段代码。通常，如果某个模式能让许多其他用户受益，那么为 TorchInductor 提交一个 issue 或功能请求来支持它是值得的。
+
+*Follow Triton best practices* When writing Triton code, ensure memory accesses are coalesced, avoid bank conflicts in shared memory (pad if needed), mask tl.load() and tl.store() at boundaries, choose block and tile sizes that align with warp sizes (multiples of 32 threads), select tile sizes that fit into the L1/shared carve-out, and tune num_warps and num_stages settings with @triton.autotune([... triton.Config(num_warps=..., num_stages=...) ...], key=[...]).. Use Triton’s autotuner to find the best configuration if performance is critical. Start with num_warps ∈ {4,8} and num_stages ∈ {2,3,4}. Remember to check the Triton documentation and examples since many common patterns like FlashAttention have already been implemented and optimized by the community. At a minimum, these existing examples are a good starting point for your own implementation.
+
+*遵循 Triton 最佳实践* 编写 Triton 代码时，确保内存访问是合并的，避免共享内存中的存储体冲突（bank conflict）（必要时进行填充），在边界处对 tl.load() 和 tl.store() 加掩码，选择与 warp 大小对齐的块和分块尺寸（32 线程的倍数），选择能装进 L1/共享内存划分区的分块尺寸，并用 @triton.autotune([... triton.Config(num_warps=..., num_stages=...) ...], key=[...]) 来调优 num_warps 和 num_stages 设置。如果性能至关重要，使用 Triton 的自动调优器来找到最佳配置。从 num_warps ∈ {4,8} 和 num_stages ∈ {2,3,4} 开始尝试。记得查阅 Triton 的文档和示例，因为许多常见模式（例如 FlashAttention）社区已经实现并优化过了。至少，这些现成的示例是你自己实现的良好起点。
+
+*Cache hint caution* Some forms of PTX loads (e.g., DeepSeek-style non-coherent + L1 no-allocate + 256B L2 prefetch) are undocumented and potentially undefined on certain hardware. This may break across driver versions and hardware generations. Prefer Triton’s eviction_policy= (e.g., evict_last) and cache_modifier= knobs to improve portability. Remember to profile when migrating to different CUDA drivers and GPU generations. Avoid introducing conflicting cache hints, as these are extremely difficult to debug.
+
+*缓存提示需谨慎* 某些形式的 PTX 加载（例如 DeepSeek 风格的非一致 + L1 不分配 + 256B L2 预取）是未有文档记载的，在某些硬件上甚至可能是未定义的。这可能会在不同驱动版本和硬件代际之间失效。优先使用 Triton 的 eviction_policy=（例如 evict_last）和 cache_modifier= 旋钮来提升可移植性。在迁移到不同的 CUDA 驱动和 GPU 代际时，记得进行剖析。避免引入相互冲突的缓存提示，因为这类问题极难调试。
+
+*Keep an eye on new PyTorch releases* PyTorch is rapidly evolving its compiler. Each version brings expanded operator support, better performance, and fewer graph breaks. Upgrading can often give free speedups or fix issues. The same goes for Triton. Staying up-to-date ensures you benefit from the latest work. This is especially important for rapidly evolving GPU hardware.
+
+*关注 PyTorch 新版本* PyTorch 正在快速演进其编译器。每个版本都会带来更广的算子支持、更好的性能以及更少的图中断。升级往往能带来免费的加速或修复问题。Triton 同理。保持更新可以确保你从最新的成果中受益。对于快速演进的 GPU 硬件而言，这一点尤为重要。
+
+## Conclusion
+
+## 结语
+
+As complexity increases and the PyTorch ecosystem continues to expand, it’s important that you embrace performance profiling and iterative optimizations. You should use Nsight Systems, Nsight Compute, PyTorch profiler, or Triton profiler together to verify that you’re getting the GPU utilization and performance that you expect. If not, adjust your performance strategy.
+
+随着复杂度上升、PyTorch 生态持续扩张，你必须拥抱性能剖析和迭代式优化。你应该把 Nsight Systems、Nsight Compute、PyTorch 剖析器或 Triton 剖析器配合使用，以验证你是否获得了预期的 GPU 利用率和性能。如果没有，就调整你的性能策略。
+
+And remember to maintain a holistic view during your iterative approach. When one bottleneck is removed, the next one will emerge. Iterative performance tuning can lead you from GPU kernel occupancy to CPU overhead to tuning the input pipeline. The compiler helps with a big piece of this puzzle, but you likely need to optimize data loading, I/O, and algorithmic choices to achieve optimal performance.
+
+同时，记得在迭代过程中保持全局视角。当一个瓶颈被消除后，下一个就会浮现。迭代式的性能调优可能会把你从 GPU 核函数占用率带到 CPU 开销，再带到调优输入流水线。编译器帮你解决了这道难题中很大的一部分，但你很可能还需要优化数据加载、I/O 和算法选择，才能达到最优性能。
