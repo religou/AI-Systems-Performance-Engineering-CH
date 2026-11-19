@@ -895,4 +895,4 @@ Nsight Compute 会报告一个 *Issue Efficiency*（发射效率）或 *IPC* 指
 
 我们讲解了如何调优占用率、避免 warp 分歧以及提高 ILP。你还看到了如何用剖析器把跨 GPU 的 CPU、核函数和 NVLink 流量关联起来。随后我们深入 Nsight Compute 获取逐核函数的细节。
 
-在接下来的几章中，我们将以此为基础，聚焦核函数级的效率，以提高算术强度。为此，你将充分利用 GPU 硬件优化的资源，例如用于计算的 Tensor Cores、为 Tensor Cores 供数的 TMEM，以及用于数据传输的 TMA。在支持 TMA 的现代 GPU 上，TMA 仍是从全局内存到共享内存进行批量拷贝的首选方法。让我们继续向着硬件的峰值性能极限进发！
+在接下来的几章中，我们将以此为基础，聚焦核函数级的效率，以提高算术强度。为此，你将充分利用 GPU 硬件优化的资源，例如用于计算的 Tensor Cores、为 Tensor Cores 供数的 TMEM，以及用于数据传输的 TMA。在支持 TMA 的现代 GPU 上，TMA 仍是从全局内存到共享内存进行批量拷贝的首选方法。
